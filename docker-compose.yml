@@ -1,0 +1,82 @@
+version: "3.8"
+
+# =============================================
+# CrashGuard AI — Production Docker Setup
+#
+# HOW COMPANY USES THIS:
+# 1. Clone repo
+# 2. Set their config in .env file
+# 3. Run: docker-compose up
+# =============================================
+
+services:
+
+  # ===== STREAMLIT DASHBOARD =====
+  dashboard:
+    build: .
+    container_name: crashguard_dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-}
+      - SERVER_NAME=${SERVER_NAME:-node-1}
+    restart: unless-stopped
+    networks:
+      - crashguard_net
+
+  # ===== BACKGROUND WORKER =====
+  # Automatically predicts CPU every 5 seconds
+  # Sends Slack alert if spike predicted in next 5 minutes
+  worker:
+    build: .
+    container_name: crashguard_worker
+    volumes:
+      - .:/app
+    command: python worker.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-}
+      - SERVER_NAME=${SERVER_NAME:-node-1}
+      - SPIKE_THRESHOLD=${SPIKE_THRESHOLD:-0.75}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-5}
+      - ALERT_COOLDOWN=${ALERT_COOLDOWN:-60}
+      - FORECAST_STEPS=${FORECAST_STEPS:-60}
+    restart: unless-stopped
+    networks:
+      - crashguard_net
+
+  # ===== FASTAPI REST API =====
+  api:
+    build: .
+    container_name: crashguard_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    networks:
+      - crashguard_net
+
+  # ===== MLFLOW TRACKING =====
+  mlflow:
+    build: .
+    container_name: crashguard_mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - .:/app
+    command: mlflow ui --host 0.0.0.0 --port 5000
+    restart: unless-stopped
+    networks:
+      - crashguard_net
+
+networks:
+  crashguard_net:
+    driver: bridge

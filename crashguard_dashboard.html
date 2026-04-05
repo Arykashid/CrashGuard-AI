@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CrashGuard AI — Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0d0d0f;
+  --surface: #141416;
+  --surface2: #1a1a1e;
+  --surface3: #202025;
+  --border: rgba(255,255,255,0.07);
+  --border2: rgba(255,255,255,0.12);
+  --text: #e8e8ea;
+  --text2: #8b8b9a;
+  --text3: #55555f;
+  --blue: #3b82f6;
+  --blue-dim: rgba(59,130,246,0.15);
+  --red: #ef4444;
+  --red-dim: rgba(239,68,68,0.15);
+  --orange: #f97316;
+  --orange-dim: rgba(249,115,22,0.12);
+  --green: #22c55e;
+  --green-dim: rgba(34,197,94,0.12);
+  --yellow: #eab308;
+  --yellow-dim: rgba(234,179,8,0.12);
+  --purple: #a855f7;
+  --font: 'Inter', -apple-system, sans-serif;
+  --mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+html, body { height: 100%; overflow: hidden; }
+body { font-family: var(--font); background: var(--bg); color: var(--text); font-size: 13px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+
+/* ── LAYOUT ── */
+.app { display: flex; height: 100vh; }
+.sidebar { width: 220px; flex-shrink: 0; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.topbar { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 20px; height: 48px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+.content { flex: 1; overflow-y: auto; padding: 16px 20px; background: var(--bg); }
+
+/* ── SIDEBAR ── */
+.sidebar-logo { padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 9px; }
+.logo-mark { width: 24px; height: 24px; border-radius: 6px; background: var(--blue); display: flex; align-items: center; justify-content: center; }
+.logo-mark svg { width: 12px; height: 12px; }
+.logo-text { font-size: 13px; font-weight: 600; color: var(--text); letter-spacing: -0.2px; }
+.logo-ver { font-size: 10px; color: var(--text3); margin-left: auto; font-family: var(--mono); }
+
+.nav-group { padding: 16px 10px 6px; }
+.nav-label { font-size: 10px; font-weight: 500; color: var(--text3); letter-spacing: 0.8px; text-transform: uppercase; padding: 0 6px; margin-bottom: 4px; }
+.nav-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; color: var(--text2); transition: all 0.1s; margin-bottom: 1px; font-size: 13px; }
+.nav-item:hover { background: var(--surface2); color: var(--text); }
+.nav-item.active { background: var(--blue-dim); color: var(--blue); }
+.nav-item svg { width: 14px; height: 14px; flex-shrink: 0; opacity: 0.8; }
+.nav-item.active svg { opacity: 1; }
+.nav-badge { margin-left: auto; font-size: 10px; font-weight: 600; font-family: var(--mono); background: var(--red-dim); color: var(--red); padding: 1px 5px; border-radius: 4px; }
+.nav-badge-g { margin-left: auto; font-size: 10px; font-weight: 500; background: var(--green-dim); color: var(--green); padding: 1px 5px; border-radius: 4px; }
+
+.sidebar-footer { margin-top: auto; padding: 12px 10px; border-top: 1px solid var(--border); }
+.user-card { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+.user-card:hover { background: var(--surface2); }
+.avatar { width: 26px; height: 26px; border-radius: 50%; background: linear-gradient(135deg, #3b82f6, #8b5cf6); display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; color: #fff; flex-shrink: 0; }
+.user-info-name { font-size: 12px; font-weight: 500; color: var(--text); }
+.user-info-role { font-size: 11px; color: var(--text3); }
+
+/* ── TOPBAR ── */
+.topbar-breadcrumb { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.bc-dim { color: var(--text3); }
+.bc-sep { color: var(--text3); }
+.bc-active { color: var(--text); font-weight: 500; }
+.topbar-right { display: flex; align-items: center; gap: 8px; }
+.time-range { display: flex; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.tr-btn { padding: 4px 10px; font-size: 12px; color: var(--text2); cursor: pointer; border-right: 1px solid var(--border); transition: all 0.1s; font-family: var(--mono); }
+.tr-btn:last-child { border-right: none; }
+.tr-btn.active { background: var(--surface3); color: var(--text); }
+.tr-btn:hover:not(.active) { color: var(--text); }
+.live-badge { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--green); font-weight: 500; padding: 4px 10px; background: var(--green-dim); border-radius: 6px; font-family: var(--mono); }
+.live-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--green); animation: pulse 1.5s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(1.3)} }
+
+/* ── METRIC CARDS ── */
+.metrics-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
+.metric-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+.mc-label { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.6px; font-weight: 500; margin-bottom: 8px; }
+.mc-value { font-size: 24px; font-weight: 600; font-family: var(--mono); color: var(--text); line-height: 1; }
+.mc-sub { font-size: 11px; color: var(--text3); margin-top: 5px; display: flex; align-items: center; gap: 4px; }
+.mc-sub .up { color: var(--red); }
+.mc-sub .down { color: var(--green); }
+.mc-sub .neutral { color: var(--text3); }
+
+/* ── PANELS ── */
+.row-2 { display: grid; grid-template-columns: 1fr 280px; gap: 10px; margin-bottom: 10px; }
+.row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; padding: 11px 14px; border-bottom: 1px solid var(--border); }
+.panel-title { font-size: 12px; font-weight: 500; color: var(--text); }
+.panel-meta { font-size: 11px; color: var(--text3); }
+.panel-action { font-size: 11px; color: var(--blue); cursor: pointer; }
+.panel-body { padding: 14px; }
+.panel-legend { display: flex; align-items: center; gap: 14px; }
+.legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text3); }
+.legend-line { width: 16px; height: 2px; border-radius: 1px; }
+.legend-dot { width: 7px; height: 7px; border-radius: 50%; }
+
+/* ── CHART ── */
+.chart-wrap { position: relative; width: 100%; height: 200px; }
+
+/* ── SERVER LIST ── */
+.server-item { display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.1s; }
+.server-item:last-child { border-bottom: none; }
+.server-item:hover { background: var(--surface2); }
+.srv-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.srv-name { font-size: 12px; font-weight: 500; color: var(--text); font-family: var(--mono); flex: 1; }
+.srv-role { font-size: 11px; color: var(--text3); min-width: 80px; }
+.srv-bar-wrap { width: 55px; height: 3px; background: var(--surface3); border-radius: 2px; overflow: hidden; }
+.srv-bar { height: 100%; border-radius: 2px; transition: width 0.5s; }
+.srv-pct { font-size: 11px; font-family: var(--mono); font-weight: 500; min-width: 30px; text-align: right; }
+.badge { font-size: 10px; font-weight: 500; padding: 2px 6px; border-radius: 4px; font-family: var(--mono); }
+.b-ok { background: var(--green-dim); color: var(--green); }
+.b-warn { background: var(--yellow-dim); color: var(--yellow); }
+.b-crit { background: var(--red-dim); color: var(--red); }
+
+/* ── INCIDENT TIMELINE ── */
+.inc-item { display: flex; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--border); }
+.inc-item:last-child { border-bottom: none; }
+.inc-timeline { display: flex; flex-direction: column; align-items: center; padding-top: 4px; }
+.inc-node { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.inc-connector { width: 1px; flex: 1; background: var(--border); margin-top: 3px; }
+.inc-ts { font-family: var(--mono); font-size: 10px; color: var(--text3); min-width: 38px; padding-top: 3px; }
+.inc-body { flex: 1; }
+.inc-title { font-size: 12px; font-weight: 500; color: var(--text); }
+.inc-desc { font-size: 11px; color: var(--text3); margin-top: 2px; }
+.sev-tag { font-size: 10px; font-weight: 500; padding: 1px 5px; border-radius: 4px; align-self: flex-start; font-family: var(--mono); margin-top: 3px; }
+
+/* ── ALERT LOG ── */
+.alert-item { display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-bottom: 1px solid var(--border); }
+.alert-item:last-child { border-bottom: none; }
+.alert-ch { font-size: 10px; color: var(--text3); min-width: 38px; font-family: var(--mono); }
+.alert-msg { flex: 1; font-size: 12px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.alert-ts { font-size: 10px; color: var(--text3); font-family: var(--mono); }
+
+/* ── SHAP ── */
+.shap-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.shap-feat { font-family: var(--mono); font-size: 11px; color: var(--text2); min-width: 100px; }
+.shap-bg { flex: 1; height: 4px; background: var(--surface3); border-radius: 2px; overflow: hidden; }
+.shap-fill { height: 100%; border-radius: 2px; transition: width 0.4s; }
+.shap-val { font-family: var(--mono); font-size: 11px; color: var(--text3); min-width: 36px; text-align: right; }
+.shap-insight { margin-top: 10px; padding: 10px 12px; background: var(--surface2); border-left: 2px solid var(--orange); border-radius: 0 6px 6px 0; font-size: 11px; color: var(--text2); line-height: 1.6; }
+
+/* ── INTEGRATIONS ── */
+.int-grid { display: grid; grid-template-columns: repeat(4,1fr); }
+.int-item { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-right: 1px solid var(--border); }
+.int-item:last-child { border-right: none; }
+.int-icon-box { width: 32px; height: 32px; border-radius: 7px; border: 1px solid var(--border); background: var(--surface2); display: flex; align-items: center; justify-content: center; font-size: 15px; }
+.int-name { font-size: 12px; font-weight: 500; color: var(--text); }
+.int-detail { font-size: 11px; color: var(--text3); }
+.int-status { display: flex; align-items: center; gap: 4px; margin-top: 2px; font-size: 11px; }
+.status-dot { width: 5px; height: 5px; border-radius: 50%; }
+.s-ok { background: var(--green); }
+.s-no { background: var(--text3); }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- SIDEBAR -->
+  <div class="sidebar">
+    <div class="sidebar-logo">
+      <div class="logo-mark">
+        <svg viewBox="0 0 12 12" fill="none"><path d="M6 1L11 10H1L6 1Z" fill="white" opacity="0.9"/></svg>
+      </div>
+      <span class="logo-text">CrashGuard AI</span>
+      <span class="logo-ver">v2.1</span>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-label">Observe</div>
+      <div class="nav-item active">
+        <svg viewBox="0 0 14 14" fill="currentColor"><rect x="1" y="1" width="5" height="5" rx="1"/><rect x="8" y="1" width="5" height="5" rx="1"/><rect x="1" y="8" width="5" height="5" rx="1"/><rect x="8" y="8" width="5" height="5" rx="1"/></svg>
+        Dashboard
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5"/><path d="M7 4v3l2 1.5"/></svg>
+        Systems
+        <span class="nav-badge">2</span>
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 2v2M7 10v2M2 7h2M10 7h2"/><circle cx="7" cy="7" r="3"/></svg>
+        Alerts
+        <span class="nav-badge">4</span>
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h10M2 7h7M2 10h5"/></svg>
+        Incidents
+      </div>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-label">Intelligence</div>
+      <div class="nav-item">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 10c0-3 2-5 5-5s5 2 5 5"/><path d="M7 5V2"/><circle cx="7" cy="2" r="1" fill="currentColor"/></svg>
+        Models
+        <span class="nav-badge-g">live</span>
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="5" width="4" height="7" rx="1"/><rect x="6" y="2" width="4" height="10" rx="1"/><rect x="10" y="7" width="2" height="5" rx="1"/></svg>
+        Experiments
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5"/><path d="M7 4v3l2 2"/></svg>
+        Explainability
+      </div>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-label">Config</div>
+      <div class="nav-item">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h2M2 7h2M2 10h2"/><rect x="5" y="3" width="7" height="2" rx="1"/><rect x="5" y="6" width="7" height="2" rx="1"/><rect x="5" y="9" width="7" height="2" rx="1"/></svg>
+        Integrations
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="2"/><path d="M7 1v2M7 11v2M1 7h2M11 7h2M3.2 3.2l1.4 1.4M9.4 9.4l1.4 1.4M3.2 10.8l1.4-1.4M9.4 4.6l1.4-1.4"/></svg>
+        Settings
+      </div>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="user-card">
+        <div class="avatar">AK</div>
+        <div>
+          <div class="user-info-name">Ary Kashid</div>
+          <div class="user-info-role">SRE · Pro Plan</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN -->
+  <div class="main">
+    <div class="topbar">
+      <div class="topbar-breadcrumb">
+        <span class="bc-dim">prod-cluster-01</span>
+        <span class="bc-sep">/</span>
+        <span class="bc-active">Dashboard</span>
+      </div>
+      <div class="topbar-right">
+        <div class="time-range">
+          <div class="tr-btn" onclick="setRange(this)">1h</div>
+          <div class="tr-btn active" onclick="setRange(this)">6h</div>
+          <div class="tr-btn" onclick="setRange(this)">24h</div>
+        </div>
+        <div class="live-badge"><div class="live-dot"></div> Live</div>
+      </div>
+    </div>
+
+    <div class="content">
+
+      <!-- METRIC CARDS -->
+      <div class="metrics-row">
+        <div class="metric-card">
+          <div class="mc-label">Fleet CPU avg</div>
+          <div class="mc-value" id="m1">43%</div>
+          <div class="mc-sub"><span class="up">↑ 8%</span> vs 1h ago</div>
+        </div>
+        <div class="metric-card">
+          <div class="mc-label">Predicted peak · 5 min</div>
+          <div class="mc-value" style="color:var(--orange);" id="m2">71%</div>
+          <div class="mc-sub"><span class="up">⚠</span> Spike likely — web-01</div>
+        </div>
+        <div class="metric-card">
+          <div class="mc-label">Active alerts</div>
+          <div class="mc-value" style="color:var(--red);">4</div>
+          <div class="mc-sub"><span class="up">2</span> unacknowledged</div>
+        </div>
+        <div class="metric-card">
+          <div class="mc-label">Model accuracy</div>
+          <div class="mc-value" style="color:var(--green);">94.7%</div>
+          <div class="mc-sub"><span class="neutral">TCN · RMSE 0.000894</span></div>
+        </div>
+      </div>
+
+      <!-- CPU CHART + SERVERS -->
+      <div class="row-2">
+        <div class="panel">
+          <div class="panel-head">
+            <span class="panel-title">CPU usage + prediction — web-01</span>
+            <div class="panel-legend">
+              <div class="legend-item"><div class="legend-line" style="background:var(--blue);"></div>Actual</div>
+              <div class="legend-item"><div class="legend-line" style="background:var(--orange);border-top:2px dashed var(--orange);height:0;"></div>Predicted</div>
+              <div class="legend-item"><div class="legend-dot" style="background:var(--red);"></div>Spike</div>
+            </div>
+          </div>
+          <div class="panel-body" style="padding:12px 14px 14px;">
+            <div class="chart-wrap"><canvas id="cpuChart"></canvas></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <span class="panel-title">Nodes</span>
+            <span class="panel-meta">5 active</span>
+          </div>
+          <div id="srv-list"></div>
+        </div>
+      </div>
+
+      <!-- INCIDENTS + ALERTS + SHAP -->
+      <div class="row-3">
+        <div class="panel">
+          <div class="panel-head">
+            <span class="panel-title">Incident timeline</span>
+            <span class="panel-action">View all →</span>
+          </div>
+          <div id="inc-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <span class="panel-title">Alert log</span>
+            <span class="panel-action">Mark all read</span>
+          </div>
+          <div id="alert-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <span class="panel-title">SHAP — why this spike?</span>
+            <span class="panel-meta">web-01 · t+5min</span>
+          </div>
+          <div class="panel-body">
+            <div style="font-size:11px;color:var(--text3);margin-bottom:10px;">Feature contributions to prediction</div>
+            <div id="shap-list"></div>
+            <div class="shap-insight">
+              <strong style="color:var(--text);">roll_mean_10</strong> is the dominant signal. Lag-1 confirms momentum. Time encoding matches a recurring Tuesday 3 PM workload pattern.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- INTEGRATIONS -->
+      <div class="panel">
+        <div class="panel-head">
+          <span class="panel-title">Integrations</span>
+          <span class="panel-action">Configure →</span>
+        </div>
+        <div class="int-grid" id="int-grid"></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+const servers = [
+  { name:'web-01', role:'Frontend', cpu:71, s:'crit' },
+  { name:'api-02', role:'Backend API', cpu:54, s:'warn' },
+  { name:'db-01',  role:'PostgreSQL', cpu:31, s:'ok' },
+  { name:'ml-03',  role:'ML Inference', cpu:44, s:'ok' },
+  { name:'cache-01',role:'Redis', cpu:18, s:'ok' },
+];
+const srvList = document.getElementById('srv-list');
+servers.forEach(s => {
+  const col = s.s==='crit'?'var(--red)':s.s==='warn'?'var(--yellow)':'var(--green)';
+  const badge = s.s==='crit'?'b-crit':s.s==='warn'?'b-warn':'b-ok';
+  const label = s.s==='crit'?'Critical':s.s==='warn'?'Warning':'OK';
+  srvList.innerHTML += `<div class="server-item">
+    <div class="srv-dot" style="background:${col};"></div>
+    <div class="srv-name">${s.name}</div>
+    <div class="srv-role">${s.role}</div>
+    <div class="srv-bar-wrap"><div class="srv-bar" style="width:${s.cpu}%;background:${col};"></div></div>
+    <div class="srv-pct" style="color:${col};">${s.cpu}%</div>
+    <span class="badge ${badge}">${label}</span>
+  </div>`;
+});
+
+const incidents = [
+  { ts:'14:52', title:'Spike predicted — web-01', desc:'Confidence 87% · Model: TCN · cpu=71%', col:'var(--red)', sev:'High', sev_c:'b-crit' },
+  { ts:'14:52', title:'Slack alert dispatched', desc:'#sre-alerts · Delivered to 6 engineers', col:'var(--blue)', sev:'Info', sev_c:'b-ok' },
+  { ts:'14:48', title:'Auto-scale triggered', desc:'k8s added 2 replicas to web-deploy', col:'var(--green)', sev:'Action', sev_c:'b-ok' },
+  { ts:'14:31', title:'Anomaly detected — api-02', desc:'Z-score 3.2 · Isolation Forest', col:'var(--yellow)', sev:'Medium', sev_c:'b-warn' },
+];
+const incList = document.getElementById('inc-list');
+incidents.forEach((inc, i) => {
+  incList.innerHTML += `<div class="inc-item">
+    <div class="inc-timeline">
+      <div class="inc-node" style="background:${inc.col};"></div>
+      ${i<incidents.length-1?'<div class="inc-connector"></div>':''}
+    </div>
+    <div class="inc-ts">${inc.ts}</div>
+    <div class="inc-body">
+      <div class="inc-title">${inc.title}</div>
+      <div class="inc-desc">${inc.desc}</div>
+    </div>
+    <span class="badge ${inc.sev_c}" style="align-self:flex-start;margin-top:3px;">${inc.sev}</span>
+  </div>`;
+});
+
+const alerts = [
+  { ch:'Slack', msg:'web-01 CPU predicted 71% in 5 min', ts:'14:52', s:'b-warn' },
+  { ch:'Email', msg:'Daily digest — 2 incidents resolved', ts:'14:00', s:'b-ok' },
+  { ch:'Slack', msg:'api-02 anomaly Z-score >3 detected', ts:'14:31', s:'b-ok' },
+  { ch:'Slack', msg:'Model retrained — RMSE improved 12%', ts:'13:10', s:'b-ok' },
+];
+const alertList = document.getElementById('alert-list');
+alerts.forEach(a => {
+  alertList.innerHTML += `<div class="alert-item">
+    <span class="alert-ch">${a.ch}</span>
+    <span class="alert-msg">${a.msg}</span>
+    <span class="alert-ts">${a.ts}</span>
+    <span class="badge ${a.s}">${a.s==='b-warn'?'Pending':'Sent'}</span>
+  </div>`;
+});
+
+const shapFeats = [
+  { feat:'roll_mean_10', val:0.42, pct:100, col:'var(--red)' },
+  { feat:'lag_1',        val:0.31, pct:74,  col:'var(--orange)' },
+  { feat:'hour_sin',     val:0.18, pct:43,  col:'var(--blue)' },
+  { feat:'roll_std_10',  val:0.12, pct:29,  col:'var(--blue)' },
+  { feat:'dow_cos',      val:0.07, pct:17,  col:'var(--blue)' },
+];
+const shapList = document.getElementById('shap-list');
+shapFeats.forEach(f => {
+  shapList.innerHTML += `<div class="shap-row">
+    <span class="shap-feat">${f.feat}</span>
+    <div class="shap-bg"><div class="shap-fill" style="width:${f.pct}%;background:${f.col};"></div></div>
+    <span class="shap-val">+${f.val.toFixed(2)}</span>
+  </div>`;
+});
+
+const integrations = [
+  { name:'Prometheus', detail:'metrics · 15s interval', icon:'📊', conn:true },
+  { name:'Kubernetes', detail:'prod-cluster-01 · 5 nodes', icon:'☸', conn:true },
+  { name:'Slack', detail:'#sre-alerts · 6 members', icon:'💬', conn:true },
+  { name:'AWS CloudWatch', detail:'Not configured', icon:'☁', conn:false },
+];
+const intGrid = document.getElementById('int-grid');
+integrations.forEach(intg => {
+  intGrid.innerHTML += `<div class="int-item">
+    <div class="int-icon-box">${intg.icon}</div>
+    <div style="flex:1;">
+      <div class="int-name">${intg.name}</div>
+      <div class="int-status">
+        <div class="status-dot ${intg.conn?'s-ok':'s-no'}"></div>
+        <span style="font-size:11px;color:${intg.conn?'var(--green)':'var(--text3)'};">${intg.conn?'Connected':'Disconnected'}</span>
+      </div>
+      <div class="int-detail">${intg.detail}</div>
+    </div>
+  </div>`;
+});
+
+function buildChart() {
+  function genData(n, base, noise) {
+    return Array.from({length:n}, (_,i) => {
+      const spike = (i===28||i===44) ? 30 : 0;
+      return Math.min(95, Math.max(8, base + spike + (Math.random()-0.5)*noise));
+    });
+  }
+  const n = 60;
+  const labels = Array.from({length:n}, (_,i) => {
+    const m = i * 6;
+    return (m % 60 === 0) ? Math.floor(m/60)+'h' : (m % 30 === 0 ? '30m' : '');
+  });
+  const actual = genData(n, 36, 12);
+  const predicted = actual.map((v,i) => i < 48 ? null : Math.min(95, v + Math.random()*10 + 4));
+  const upper = predicted.map(v => v !== null ? Math.min(99, v+9) : null);
+  const lower = predicted.map(v => v !== null ? Math.max(0, v-9) : null);
+  const spikes = actual.map((v,i) => (i===28||i===44) ? v : null);
+
+  const ctx = document.getElementById('cpuChart').getContext('2d');
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label:'Actual CPU',
+          data: actual,
+          borderColor:'#3b82f6',
+          backgroundColor:'rgba(59,130,246,0.06)',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.4,
+          fill: true,
+          order: 3
+        },
+        {
+          label:'Predicted',
+          data: predicted,
+          borderColor:'#f97316',
+          borderDash:[5,3],
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.4,
+          fill: false,
+          order: 2
+        },
+        {
+          label:'Upper CI',
+          data: upper,
+          borderColor:'rgba(249,115,22,0.2)',
+          borderWidth: 1,
+          pointRadius: 0,
+          fill: '+1',
+          backgroundColor:'rgba(249,115,22,0.06)',
+          tension: 0.4,
+          order: 4
+        },
+        {
+          label:'Lower CI',
+          data: lower,
+          borderColor:'rgba(249,115,22,0.2)',
+          borderWidth: 1,
+          pointRadius: 0,
+          fill: false,
+          tension: 0.4,
+          order: 5
+        },
+        {
+          label:'Spike',
+          data: spikes,
+          borderColor:'transparent',
+          backgroundColor:'#ef4444',
+          pointRadius: 5,
+          pointStyle: 'circle',
+          showLine: false,
+          order: 1
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode:'index', intersect:false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor:'#1a1a1e',
+          borderColor:'rgba(255,255,255,0.1)',
+          borderWidth: 1,
+          titleColor:'#e8e8ea',
+          bodyColor:'#8b8b9a',
+          callbacks: { label: ctx => ' ' + ctx.dataset.label + ': ' + (ctx.parsed.y !== null ? Math.round(ctx.parsed.y)+'%' : '—') }
+        }
+      },
+      scales: {
+        x: {
+          grid: { color:'rgba(255,255,255,0.04)' },
+          ticks: { color:'#55555f', font:{ size:10, family:"'JetBrains Mono', monospace" }, maxRotation:0 },
+          border: { display:false }
+        },
+        y: {
+          min:0, max:100,
+          grid: { color:'rgba(255,255,255,0.04)' },
+          ticks: {
+            color:'#55555f',
+            font:{ size:10, family:"'JetBrains Mono', monospace" },
+            callback: v => v+'%',
+            stepSize: 25
+          },
+          border: { display:false }
+        }
+      }
+    }
+  });
+}
+buildChart();
+
+function setRange(el) {
+  document.querySelectorAll('.tr-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+}
+
+setInterval(() => {
+  const v = Math.round(30 + Math.random()*50);
+  document.getElementById('m1').textContent = v + '%';
+  const pred = Math.round(v + Math.random()*20);
+  document.getElementById('m2').textContent = Math.min(99, pred) + '%';
+}, 3000);
+</script>
+</body>
+</html>

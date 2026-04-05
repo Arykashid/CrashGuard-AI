@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data and Models
+data/*.csv
+models/*.h5
+models/*.hdf5
+
+# Results (optional - uncomment if you don't want to track plots)
+# results/*.png
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ── CrashGuard AI (added) ──────────────────
+# Secrets — never upload to GitHub
+.env
+.streamlit/secrets.toml
+
+# Trained models
+saved_model.pkl
+saved_model.keras
+*.keras
+*.pkl
+
+# Logs
+*.log
+worker.log
+predictions.json
+
+# MLflow
+mlruns/
+
+# Experiments metadata
+experiments/
+
+# Optuna database
+optuna_study.db
+*.db
