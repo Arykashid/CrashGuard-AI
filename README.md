@@ -87,7 +87,7 @@ Why not SHAP for LSTMs:
 
 ### End-to-End CrashGuard AI Pipeline (Real-Time Prediction + Alerting)
 
-![System Architecture](assets/mermaid-diagram(2).png)
+![System Architecture](assets/architecture.png)
 
 *This system predicts CPU spikes in advance and triggers alerts based on uncertainty-aware forecasts.*
 
