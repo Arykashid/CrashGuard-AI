@@ -85,29 +85,44 @@ Why not SHAP for LSTMs:
 
 ## System Architecture
 
-![System Architecture](assets/mermaid-diagram.png)
+### End-to-End CrashGuard AI Pipeline (Real-Time Prediction + Alerting)
 
-```
-[Data Sources]          [Preprocessing]         [Models]
-psutil / Prometheus  →  MinMaxScaler         →  LSTM (primary)
-60K synthetic rows      10 feature vectors      TCN (comparison)
-                        Sliding window (60)     Transformer (comparison)
-                        Walk-forward splits
+![System Architecture](assets/mermaid-diagram(2).png)
 
-[Inference]             [Outputs]               [Alerting]
-MC Dropout (50x)     →  Point prediction    →   Slack webhook
-Integrated Gradients    95% CI bands            Severity levels (H/M/L)
-Confidence score        5-step forecast         60s cooldown
-                        Feature attribution     Prediction log (JSON)
+*This system predicts CPU spikes in advance and triggers alerts based on uncertainty-aware forecasts.*
 
-[Tracking]
-MLflow experiment log
-Optuna hyperparameter tuning
-Ablation study (4 configs)
-PDF report generation
-```
+DATA SOURCES
+- Google Cluster Trace dataset (~60K CPU observations)
+- Real-time CPU monitoring via psutil
 
----
+PREPROCESSING
+- MinMax scaling (leakage-safe)
+- Time + lag features (10 features)
+- Sliding window (60)
+- Walk-forward validation
+
+MODELS
+- LSTM (primary)
+- TCN / Transformer (baselines)
+
+INFERENCE
+- MC Dropout (50 samples)
+- Integrated Gradients (explainability)
+- Confidence scoring
+
+OUTPUTS
+- Point forecast
+- 95% confidence interval
+- Multi-step prediction (5-step)
+- Feature attribution
+
+DECISION & ALERTING
+- Spike detection logic
+- Slack webhook alerts
+- Severity classification (H/M/L)
+- Cooldown system (60s)
+
+
 
 ## Comparison with Datadog
 
