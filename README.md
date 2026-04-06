@@ -85,6 +85,8 @@ Why not SHAP for LSTMs:
 
 ## System Architecture
 
+![System Architecture](assets/mermaid-diagram.png)
+
 ```
 [Data Sources]          [Preprocessing]         [Models]
 psutil / Prometheus  →  MinMaxScaler         →  LSTM (primary)
@@ -212,4 +214,3 @@ crashguard_ai/
 
 ---
 
-*Built for HackaTUM 2024 | Portfolio project for MS applications (TUM, LMU, RWTH, KIT)*
