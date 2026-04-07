@@ -2,10 +2,15 @@
 worker.py — CrashGuard AI Background Worker
 FIXES APPLIED:
   1. WINDOW_SIZE default 40 → 60 (matches training)
-  2. model.predict() → model(X_tensor, training=False) (MC Dropout active)
-  3. n_mc 10 → 30 (stable confidence estimates)
-  4. Recursive forecast capped at 10 steps (beyond = error accumulation)
-  5. Confidence: exponential decay, never clips to 0.00
+  2. build_features: 10 features → 12 features (added lag2, lag3)
+  3. build_features: feature ORDER matches preprocessing.py exactly
+     Order: cpu, hour_sin, hour_cos, dow_sin, dow_cos,
+            lag1, lag5, lag10, lag2, lag3, roll_mean, roll_std
+  4. X reshape: hardcoded (1, WINDOW_SIZE, 10) → (1, WINDOW_SIZE, N_FEATURES)
+  5. model(X, training=False) for MC Dropout — keeps dropout active
+  6. n_mc 10 → 30 (stable confidence estimates)
+  7. Recursive forecast capped at 10 steps
+  8. Confidence: exponential decay, never clips to 0.00
 """
 
 import time
@@ -34,19 +39,23 @@ log = logging.getLogger(__name__)
 # CONFIG — ALL must match training exactly
 # =============================================
 CHECK_INTERVAL       = int(os.getenv("CHECK_INTERVAL", 5))
-WINDOW_SIZE          = int(os.getenv("WINDOW_SIZE", 60))       # FIX: was 40
+WINDOW_SIZE          = int(os.getenv("WINDOW_SIZE", 60))        # matches training
 SPIKE_THRESHOLD      = float(os.getenv("SPIKE_THRESHOLD", 0.75))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.4))
 ALERT_COOLDOWN       = int(os.getenv("ALERT_COOLDOWN", 60))
 PREDICTION_LOG       = os.getenv("PREDICTION_LOG", "predictions.json")
-FORECAST_STEPS       = int(os.getenv("FORECAST_STEPS", 10))    # FIX: was 60
+FORECAST_STEPS       = int(os.getenv("FORECAST_STEPS", 10))
 PROMETHEUS_URL       = os.getenv("PROMETHEUS_URL", "")
 SERVER_NAME          = os.getenv("SERVER_NAME", "node-1")
-N_MC_SAMPLES         = 30                                       # FIX: was 10
+N_MC_SAMPLES         = 30
 
-cpu_history    = deque(maxlen=200)
+# FIX: Use N_FEATURES constant — never hardcode 10 again
+# Must match preprocessing.py feature_cols list exactly
+N_FEATURES = 12
+
+cpu_history     = deque(maxlen=200)
 last_alert_time = None
-alert_count    = 0
+alert_count     = 0
 
 
 def load_model():
@@ -95,36 +104,70 @@ def get_cpu():
 
 
 def build_features(cpu_array):
+    """
+    Build 12-feature matrix from CPU history array.
+
+    CRITICAL: Feature order MUST match preprocessing.py exactly.
+    preprocessing.py feature_cols order:
+        cpu_usage(0), hour_sin(1), hour_cos(2), dow_sin(3), dow_cos(4),
+        lag1(5), lag5(6), lag10(7), lag2(8), lag3(9),
+        roll_mean_10(10), roll_std_10(11)
+
+    Returns: np.array of shape (len(cpu_array), 12)
+    """
+    now = datetime.now()
+    h   = now.hour
+    dow = now.weekday()
+
+    hour_sin = np.sin(2 * np.pi * h / 24)
+    hour_cos = np.cos(2 * np.pi * h / 24)
+    dow_sin  = np.sin(2 * np.pi * dow / 7)
+    dow_cos  = np.cos(2 * np.pi * dow / 7)
+
     features = []
     for i, c in enumerate(cpu_array):
-        h         = datetime.now().hour
-        dow       = datetime.now().weekday()
-        hour_sin  = np.sin(2 * np.pi * h / 24)
-        hour_cos  = np.cos(2 * np.pi * h / 24)
-        dow_sin   = np.sin(2 * np.pi * dow / 7)
-        dow_cos   = np.cos(2 * np.pi * dow / 7)
-        lag1      = cpu_array[i - 1]  if i > 0  else c
-        lag5      = cpu_array[i - 5]  if i > 4  else c
-        lag10     = cpu_array[i - 10] if i > 9  else c
-        roll_mean = np.mean(cpu_array[max(0, i - 10):i + 1])
-        roll_std  = np.std(cpu_array[max(0, i - 10):i + 1]) + 1e-6
+        # Lag features — all computed, ordered to match preprocessing.py
+        lag1  = cpu_array[i - 1]  if i >= 1  else c
+        lag2  = cpu_array[i - 2]  if i >= 2  else c   # FIX: was missing
+        lag3  = cpu_array[i - 3]  if i >= 3  else c   # FIX: was missing
+        lag5  = cpu_array[i - 5]  if i >= 5  else c
+        lag10 = cpu_array[i - 10] if i >= 10 else c
+
+        # Rolling statistics
+        window_slice = cpu_array[max(0, i - 10):i + 1]
+        roll_mean = float(np.mean(window_slice))
+        roll_std  = float(np.std(window_slice)) + 1e-6
+
+        # FIX: Order matches preprocessing.py exactly
+        # lag1(5), lag5(6), lag10(7), lag2(8), lag3(9)
         features.append([
-            c, hour_sin, hour_cos, dow_sin, dow_cos,
-            lag1, lag5, lag10, roll_mean, roll_std
+            c,                          # 0:  cpu_usage
+            hour_sin,                   # 1:  hour_sin
+            hour_cos,                   # 2:  hour_cos
+            dow_sin,                    # 3:  dow_sin
+            dow_cos,                    # 4:  dow_cos
+            lag1,                       # 5:  lag1
+            lag5,                       # 6:  lag5    ← preprocessing index 6
+            lag10,                      # 7:  lag10   ← preprocessing index 7
+            lag2,                       # 8:  lag2    ← preprocessing index 8
+            lag3,                       # 9:  lag3    ← preprocessing index 9
+            roll_mean,                  # 10: roll_mean_10
+            roll_std,                   # 11: roll_std_10
         ])
+
     return np.array(features, dtype=np.float32)
 
 
 def mc_predict_single(model, X):
     """
-    CORRECT MC Dropout inference.
+    MC Dropout inference — dropout stays ON during inference.
 
-    KEY: model(X, training=False) triggers MCDropout.call()
-    which internally forces training=True → dropout stays active
-    → each of N_MC_SAMPLES passes is different → std > 0.
+    Uses model(X, training=False) which triggers MCDropout.call()
+    MCDropout.call() internally uses tf.nn.dropout — always active
+    regardless of training flag — so each pass uses different mask.
 
-    WRONG (old code): model.predict(X) → dropout disabled → std=0
-                      → confidence=0.00 every time
+    WRONG (old): model.predict(X) → standard dropout disabled → std=0
+    RIGHT (now): model(X, training=False) + MCDropout → std > 0
     """
     X_tensor = tf.constant(X, dtype=tf.float32)
     preds = [
@@ -134,7 +177,7 @@ def mc_predict_single(model, X):
     mean = float(np.clip(np.mean(preds), 0.0, 1.0))
     std  = float(np.std(preds))
 
-    # Exponential decay confidence — smooth, never hits 0.00
+    # Exponential decay confidence
     # std=0.00 → conf=1.00 | std=0.05 → conf=0.37 | std=0.15 → conf=0.05
     confidence = float(np.clip(np.exp(-std / 0.05), 0.05, 1.0))
     return mean, std, confidence
@@ -150,7 +193,9 @@ def predict_next_5_minutes(model, history):
         for step in range(FORECAST_STEPS):
             cpu_arr  = np.array(hist[-WINDOW_SIZE:])
             features = build_features(cpu_arr)
-            X        = features.reshape(1, WINDOW_SIZE, 10)
+
+            # FIX: Use N_FEATURES (12) not hardcoded 10
+            X = features.reshape(1, WINDOW_SIZE, N_FEATURES)
 
             mean_pred, std_pred, confidence = mc_predict_single(model, X)
 
@@ -247,8 +292,10 @@ def check_alert(current, predictions, confidence, time_to_spike):
 
 def run():
     log.info("CrashGuard AI Worker starting")
-    log.info(f"Window: {WINDOW_SIZE} | Forecast: {FORECAST_STEPS} | MC samples: {N_MC_SAMPLES}")
-    log.info(f"Spike threshold: {SPIKE_THRESHOLD:.0%} | Slack: {'yes' if SLACK_WEBHOOK_URL else 'no'}")
+    log.info(f"Window: {WINDOW_SIZE} | Features: {N_FEATURES} | "
+             f"Forecast: {FORECAST_STEPS} | MC samples: {N_MC_SAMPLES}")
+    log.info(f"Spike threshold: {SPIKE_THRESHOLD:.0%} | "
+             f"Slack: {'yes' if SLACK_WEBHOOK_URL else 'no'}")
 
     model = load_model()
     if model is None:
@@ -275,11 +322,17 @@ def run():
             else:
                 log.info(
                     f"CPU: {current:.1%} | "
-                    f"Warming up ({max(0, WINDOW_SIZE - len(cpu_history))} more needed)"
+                    f"Warming up "
+                    f"({max(0, WINDOW_SIZE - len(cpu_history))} more readings needed)"
                 )
 
-            alert_fired   = check_alert(current, predictions, confidence or 0.0, time_to_spike)
-            predicted_val = max(p["predicted"] for p in predictions) if predictions else None
+            alert_fired   = check_alert(
+                current, predictions, confidence or 0.0, time_to_spike
+            )
+            predicted_val = (
+                max(p["predicted"] for p in predictions)
+                if predictions else None
+            )
             log_prediction(current, predicted_val, confidence, alert_fired)
             time.sleep(CHECK_INTERVAL)
 
