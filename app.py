@@ -273,8 +273,8 @@ with tab1:
                 mc_mean = arrays.get("mc_mean", y_pred)
                 mc_std  = arrays.get("mc_std",  np.zeros_like(y_pred))
                 n       = min(200, len(y_true))
-                upper   = mc_mean[:n] + 1.96 * mc_std[:n]
-                lower   = mc_mean[:n] - 1.96 * mc_std[:n]
+                upper   = np.clip(mc_mean[:n] + 1.96 * mc_std[:n], 0.0, 1.0)
+                lower   = np.clip(mc_mean[:n] - 1.96 * mc_std[:n], 0.0, 1.0)
 
                 fig_fc = go.Figure()
                 fig_fc.add_trace(go.Scatter(y=y_true[:n], name="Actual",
@@ -517,11 +517,13 @@ with tab3:
 
         if len(st.session_state["live_history"]) >= expected_window:
             try:
-                live_window = build_live_feature_window(
+                raw_window = build_live_feature_window(
                     st.session_state["live_history"],
                     window_size=expected_window
                 )
-                live_window = np.array(live_window)
+
+                live_window = raw_window.reshape(1, expected_window, expected_features)
+                print(live_window.shape)
 
                 if live_window.shape != (expected_window, expected_features):
                     st.error(
