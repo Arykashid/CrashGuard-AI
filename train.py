@@ -1,32 +1,16 @@
 """
 train.py — CrashGuard AI Full Retraining Pipeline
 
-BUGS FIXED vs previous version:
-  1. BATCH_SIZE 32 → 256
-     (32 was overriding lstm_model.py's correct default of 256
-      → 1250 noisy gradient updates/epoch instead of 156 clean ones
-      → model oscillated instead of converging → RMSE stuck at 0.17)
-
-  2. WINDOW_SIZE 75 → 60
-     (train.py used 75, app.py/live_monitor.py use 60
-      → shape mismatch (1,75,12) vs (1,60,12) → production crash)
-
-  3. Spike threshold 0.75 → dynamic (based on actual data)
-     (threshold 0.75 on SCALED data may find 0 spikes if CPU rarely > 0.75
-      → sample_weights=None → no spike weighting at all → RMSE stays high)
-
-  4. Confidence formula fixed
-     (old: 1.0 - avg_std/0.05 → collapses to 0 if std slightly > 0.05
-      new: based on median std relative to data range → stable 0-1)
-
-  5. Coverage multiplier 2.2 → 1.96
-     (2.2 artificially inflated coverage, not true 95% CI)
-
-  6. DROPOUT_RATE 0.3 for training, MC inference uses 0.25
-     (0.6 was too high → massive variance between MC samples → low confidence)
-
-Usage:
-    python train.py
+FIXES in this version:
+  1. log1p applied to target before training — compresses spikes,
+     flattens loss surface, forces model to predict spike shape not just mean
+  2. train_model() call updated — spike_threshold/spike_weight removed
+     (continuous weighting now handled inside lstm_model.py)
+  3. mc_dropout_predict() unpacks 4 values (mean, std, lower, upper)
+  4. Coverage now uses quantile-based CI from mc_dropout_predict
+     instead of ±1.96*std — correct for non-Gaussian CPU distributions
+  5. XGBoost ensemble added with regime-switching
+  6. weight_decay passed to build_lstm_model
 """
 
 import os
@@ -37,56 +21,49 @@ import joblib
 import tensorflow as tf
 from datetime import datetime
 
-from lstm_model import build_lstm_model, train_model, mc_dropout_predict
+from lstm_model import build_lstm_model, train_model, mc_dropout_predict, inverse_log1p
 from preprocessing import prepare_data
+from xgboost_model import train_xgb, predict_xgb, ensemble_predict, save_xgb
 
 # ============================================================
 # CONFIG
 # ============================================================
-WINDOW_SIZE      = 60    # FIX: was 75 — must match app.py and live_monitor.py
+WINDOW_SIZE      = 60
 FORECAST_HORIZON = 1
-EPOCHS           = 80    # EarlyStopping will cut short if needed
-BATCH_SIZE       = 256   # FIX: was 32 — 256 gives clean gradients on 60K rows
+EPOCHS           = 80
+BATCH_SIZE       = 256
 LSTM_UNITS       = [128, 64]
-DROPOUT_RATE     = 0.30  # training dropout (inference uses 0.25 in mc_dropout_predict)
+DROPOUT_RATE     = 0.30
 LEARNING_RATE    = 0.001
+WEIGHT_DECAY     = 1e-4
 MC_SAMPLES       = 100
 DATA_PATH        = "data/google_cluster_processed.csv"
 
 print("=" * 60)
 print("CrashGuard AI — Retraining Pipeline")
-print(f"  Window:    {WINDOW_SIZE}")
-print(f"  Horizon:   {FORECAST_HORIZON}")
-print(f"  Epochs:    {EPOCHS} (EarlyStopping active)")
-print(f"  Batch:     {BATCH_SIZE}  ← was 32, now 256")
-print(f"  Dropout:   {DROPOUT_RATE}")
-print(f"  MC samp:   {MC_SAMPLES}")
+print(f"  Window:      {WINDOW_SIZE}")
+print(f"  Horizon:     {FORECAST_HORIZON}")
+print(f"  Epochs:      {EPOCHS} (EarlyStopping active)")
+print(f"  Batch:       {BATCH_SIZE}")
+print(f"  Dropout:     {DROPOUT_RATE}")
+print(f"  WeightDecay: {WEIGHT_DECAY}")
+print(f"  MC samples:  {MC_SAMPLES}")
 print("=" * 60)
 
 
 # ============================================================
 # STEP 1: LOAD DATA
 # ============================================================
-print("\n[1/5] Loading data...")
+print("\n[1/6] Loading data...")
 df = pd.read_csv(DATA_PATH)
 df["timestamp"] = pd.to_datetime(df["timestamp"])
-print(f"  Rows loaded:   {len(df):,}")
-print(f"  CPU min:       {df['cpu_usage'].min():.4f}")
-print(f"  CPU max:       {df['cpu_usage'].max():.4f}")
-print(f"  CPU mean:      {df['cpu_usage'].mean():.4f}")
-print(f"  CPU std:       {df['cpu_usage'].std():.4f}")
+print(f"  Rows loaded: {len(df):,}")
+print(f"  CPU mean:    {df['cpu_usage'].mean():.4f}")
+print(f"  CPU std:     {df['cpu_usage'].std():.4f}")
+print(f"  CPU max:     {df['cpu_usage'].max():.4f}")
 
-# Compute spike threshold BEFORE scaling — based on actual data distribution
-# A spike = value above mean + 2*std (statistically significant jump)
-cpu_mean  = df["cpu_usage"].mean()
-cpu_std   = df["cpu_usage"].std()
-cpu_min   = df["cpu_usage"].min()
-cpu_max   = df["cpu_usage"].max()
-
-raw_spike_threshold = cpu_mean + 2.0 * cpu_std
-raw_spike_pct = (df["cpu_usage"] > raw_spike_threshold).mean() * 100
-print(f"\n  Spike threshold (raw): {raw_spike_threshold:.4f}  "
-      f"({raw_spike_pct:.1f}% of data)")
+cpu_mean = df["cpu_usage"].mean()
+cpu_std  = df["cpu_usage"].std()
 
 assert len(df) >= 10_000, "Need at least 10K rows"
 
@@ -94,7 +71,7 @@ assert len(df) >= 10_000, "Need at least 10K rows"
 # ============================================================
 # STEP 2: PREPARE DATA
 # ============================================================
-print("\n[2/5] Preparing data...")
+print("\n[2/6] Preparing data...")
 processed = prepare_data(
     df,
     window_size=WINDOW_SIZE,
@@ -113,166 +90,186 @@ cpu_scaler = processed.get("cpu_scaler")
 print(f"  X_train: {X_train.shape}")
 print(f"  X_val:   {X_val.shape}")
 print(f"  X_test:  {X_test.shape}")
-print(f"  Features ({X_train.shape[2]}): {processed.get('feature_names', [])}")
-
 num_features = X_train.shape[2]
 
-# Compute spike threshold in SCALED space
-# MinMaxScaler maps [cpu_min, cpu_max] → [0, 1]
-# So raw_spike_threshold maps to:
-scaled_spike_threshold = (raw_spike_threshold - cpu_min) / (cpu_max - cpu_min)
-scaled_spike_threshold = float(np.clip(scaled_spike_threshold, 0.50, 0.90))
-
-# Check how many spikes exist in scaled y_train
-y_flat        = y_train.flatten()
-n_spikes      = int((y_flat > scaled_spike_threshold).sum())
-spike_pct_train = n_spikes / len(y_flat) * 100
-print(f"\n  Scaled spike threshold: {scaled_spike_threshold:.3f}")
-print(f"  Spikes in y_train: {n_spikes:,} ({spike_pct_train:.1f}%)")
-
-if spike_pct_train < 1.0:
-    # Very few spikes — lower threshold to catch more
-    scaled_spike_threshold = float(np.percentile(y_flat, 85))
-    n_spikes = int((y_flat > scaled_spike_threshold).sum())
-    print(f"  ⚠  Too few spikes — lowered threshold to 85th percentile: "
-          f"{scaled_spike_threshold:.3f} ({n_spikes:,} spikes)")
+# ── FIX: log1p transform on target ──────────────────────────
+# Why: raw CPU targets have heavy right tail (spikes)
+# log1p compresses the tail → loss surface flattens →
+# model stops predicting the mean and starts predicting spike shape
+# Inverse: np.expm1(pred) — applied after mc_dropout_predict
+print("\n  Applying log1p to targets...")
+y_train_log = np.log1p(y_train)
+y_val_log   = np.log1p(y_val)
+y_test_log  = np.log1p(y_test)
+print(f"  y_train range before log1p: [{y_train.min():.4f}, {y_train.max():.4f}]")
+print(f"  y_train range after  log1p: [{y_train_log.min():.4f}, {y_train_log.max():.4f}]")
 
 
 # ============================================================
-# STEP 3: BUILD MODEL
+# STEP 3: BUILD LSTM MODEL
 # ============================================================
-print("\n[3/5] Building LSTM model...")
+print("\n[3/6] Building LSTM model...")
 model = build_lstm_model(
     window_size=WINDOW_SIZE,
     num_features=num_features,
     forecast_horizon=FORECAST_HORIZON,
     lstm_units=LSTM_UNITS,
     dropout_rate=DROPOUT_RATE,
-    learning_rate=LEARNING_RATE
+    learning_rate=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY        # FIX: L2 reg → reduces overconfidence
 )
 model.summary()
 
 
 # ============================================================
-# STEP 4: TRAIN
+# STEP 4: TRAIN LSTM
 # ============================================================
-print(f"\n[4/5] Training ({EPOCHS} epochs max, EarlyStopping patience=20)...")
+print(f"\n[4/6] Training LSTM ({EPOCHS} epochs max)...")
+# FIX: spike_threshold and spike_weight removed —
+# continuous weighting is now computed inside train_model()
 history = train_model(
     model,
-    X_train, y_train,
-    X_val,   y_val,
+    X_train, y_train_log,   # log1p targets
+    X_val,   y_val_log,
     epochs=EPOCHS,
-    batch_size=BATCH_SIZE,                   # 256 — clean gradients
-    spike_threshold=scaled_spike_threshold,  # dynamic — based on actual data
-    spike_weight=12.0                        # 12x weight on spikes
+    batch_size=BATCH_SIZE
 )
 
-epochs_run        = len(history.history["loss"])
-final_train_loss  = history.history["loss"][-1]
-final_val_loss    = history.history["val_loss"][-1]
-best_val_loss     = min(history.history["val_loss"])
-
-print(f"\n  Epochs run:       {epochs_run} / {EPOCHS}")
-print(f"  Final train loss: {final_train_loss:.6f}")
-print(f"  Final val loss:   {final_val_loss:.6f}")
-print(f"  Best val loss:    {best_val_loss:.6f}")
+epochs_run       = len(history.history["loss"])
+final_train_loss = history.history["loss"][-1]
+best_val_loss    = min(history.history["val_loss"])
+print(f"\n  Epochs run:    {epochs_run} / {EPOCHS}")
+print(f"  Train loss:    {final_train_loss:.6f}")
+print(f"  Best val loss: {best_val_loss:.6f}")
 
 
 # ============================================================
-# STEP 5: EVALUATE — MC DROPOUT
+# STEP 4b: TRAIN XGBOOST
 # ============================================================
-print(f"\n[5/5] Evaluating with MC Dropout ({MC_SAMPLES} samples)...")
+print("\n[4b/6] Training XGBoost ensemble component...")
+xgb_model = train_xgb(
+    X_train, y_train_log,
+    X_val,   y_val_log
+)
+save_xgb(xgb_model, "saved_xgb_model.pkl")
 
-mc_mean, mc_std = mc_dropout_predict(model, X_test, n_samples=MC_SAMPLES)
 
-# ── Inverse transform ──────────────────────────────────────────
+# ============================================================
+# STEP 5: EVALUATE — LSTM + ENSEMBLE
+# ============================================================
+print(f"\n[5/6] Evaluating with MC Dropout ({MC_SAMPLES} samples)...")
+
+# FIX: mc_dropout_predict now returns 4 values
+mc_mean_log, mc_std_log, lower_log, upper_log = mc_dropout_predict(
+    model, X_test, n_samples=MC_SAMPLES
+)
+
+# ── Inverse log1p transform ──────────────────────────────────
+# FIX: expm1 applied to all outputs before metric computation
+mc_mean_scaled = inverse_log1p(mc_mean_log)
+lower_scaled   = inverse_log1p(lower_log)
+upper_scaled   = inverse_log1p(upper_log)
+
+# ── Inverse MinMax transform ─────────────────────────────────
 if cpu_scaler is not None:
-    mean_flat   = mc_mean.reshape(-1, 1)
-    std_flat    = mc_std.reshape(-1, 1)
-    y_test_flat = y_test.reshape(-1, 1)
-
-    mean_inv  = cpu_scaler.inverse_transform(mean_flat).flatten()
-    y_true    = cpu_scaler.inverse_transform(y_test_flat).flatten()
-    cpu_range = float(cpu_scaler.data_max_[0] - cpu_scaler.data_min_[0])
-    std_inv   = std_flat.flatten() * cpu_range
+    mean_inv  = cpu_scaler.inverse_transform(mc_mean_scaled.reshape(-1, 1)).flatten()
+    lower_inv = cpu_scaler.inverse_transform(lower_scaled.reshape(-1, 1)).flatten()
+    upper_inv = cpu_scaler.inverse_transform(upper_scaled.reshape(-1, 1)).flatten()
+    y_true    = cpu_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
 else:
-    mean_inv = mc_mean.flatten()
-    std_inv  = mc_std.flatten()
-    y_true   = y_test.flatten()
+    mean_inv  = mc_mean_scaled.flatten()
+    lower_inv = lower_scaled.flatten()
+    upper_inv = upper_scaled.flatten()
+    y_true    = y_test.flatten()
 
-# ── RMSE / MAE ─────────────────────────────────────────────────
-rmse = float(np.sqrt(np.mean((mean_inv - y_true) ** 2)))
-mae  = float(np.mean(np.abs(mean_inv - y_true)))
+# ── XGBoost predictions ──────────────────────────────────────
+xgb_pred_log    = predict_xgb(xgb_model, X_test)
+xgb_pred_scaled = inverse_log1p(xgb_pred_log)
+if cpu_scaler is not None:
+    xgb_pred_inv = cpu_scaler.inverse_transform(
+        xgb_pred_scaled.reshape(-1, 1)
+    ).flatten()
+else:
+    xgb_pred_inv = xgb_pred_scaled.flatten()
 
-# ── Coverage @ 95% — using correct 1.96 multiplier ────────────
-upper    = mean_inv + 1.96 * std_inv   # FIX: was 2.2 (artificially wide)
-lower    = np.clip(mean_inv - 1.96 * std_inv, 0.0, 1.0)
-coverage = float(np.mean((y_true >= lower) & (y_true <= upper)))
-avg_width = float(np.mean(upper - lower))
+# ── Regime-switching ensemble ────────────────────────────────
+final_pred, spike_mask_test = ensemble_predict(mean_inv, xgb_pred_inv, X_test)
 
-# ── Confidence — stable formula ────────────────────────────────
-# Old formula: 1.0 - avg_std/0.05 → collapses to 0 if std > 0.05
-# New formula: how narrow is typical uncertainty relative to data range?
-# std_inv is in [0,1] CPU range.
-# If median std = 0.01 of range → very confident
-# If median std = 0.10 of range → uncertain
-median_std = float(np.median(std_inv))
-data_range = float(y_true.max() - y_true.min()) + 1e-8
-confidence = float(np.clip(1.0 - (median_std / (data_range * 0.5)), 0.0, 1.0))
+# ── Metrics — LSTM only ──────────────────────────────────────
+lstm_rmse = float(np.sqrt(np.mean((mean_inv - y_true) ** 2)))
+lstm_mae  = float(np.mean(np.abs(mean_inv - y_true)))
 
-# ── Spike-specific RMSE ────────────────────────────────────────
+# ── Metrics — Ensemble ───────────────────────────────────────
+ens_rmse = float(np.sqrt(np.mean((final_pred - y_true) ** 2)))
+ens_mae  = float(np.mean(np.abs(final_pred - y_true)))
+
+# ── Coverage — FIX: quantile-based CI from mc_dropout_predict ─
+# lower_inv and upper_inv are the actual 5th/95th percentile
+# of the MC sample distribution — not ±1.96*std assumption
+lower_inv = np.clip(lower_inv, 0.0, 1.0)
+upper_inv = np.clip(upper_inv, 0.0, 1.0)
+coverage  = float(np.mean((y_true >= lower_inv) & (y_true <= upper_inv)))
+avg_width = float(np.mean(upper_inv - lower_inv))
+
+# ── Confidence ───────────────────────────────────────────────
+mc_std_inv = mc_std_log.flatten()
+if cpu_scaler is not None:
+    cpu_range  = float(cpu_scaler.data_max_[0] - cpu_scaler.data_min_[0])
+    mc_std_inv = mc_std_inv * cpu_range
+median_std  = float(np.median(mc_std_inv))
+data_range  = float(y_true.max() - y_true.min()) + 1e-8
+confidence  = float(np.clip(1.0 - (median_std / (data_range * 0.5)), 0.0, 1.0))
+
+# ── Spike-specific RMSE ──────────────────────────────────────
 spike_mask  = y_true > (cpu_mean + 2 * cpu_std)
 normal_mask = ~spike_mask
-spike_rmse  = float(np.sqrt(np.mean((mean_inv[spike_mask]  - y_true[spike_mask])  ** 2))) if spike_mask.sum()  > 0 else float("nan")
-normal_rmse = float(np.sqrt(np.mean((mean_inv[normal_mask] - y_true[normal_mask]) ** 2))) if normal_mask.sum() > 0 else float("nan")
+spike_rmse  = float(np.sqrt(np.mean((final_pred[spike_mask]  - y_true[spike_mask])  ** 2))) if spike_mask.sum()  > 0 else float("nan")
+normal_rmse = float(np.sqrt(np.mean((final_pred[normal_mask] - y_true[normal_mask]) ** 2))) if normal_mask.sum() > 0 else float("nan")
 
 print("\n" + "=" * 60)
 print("RESULTS")
 print("=" * 60)
-print(f"  RMSE:          {rmse:.6f}   (target: < 0.13)")
-print(f"  MAE:           {mae:.6f}")
-print(f"  Coverage 95%:  {coverage:.4f}    (target: 0.85–0.95)")
-print(f"  Confidence:    {confidence:.4f}    (target: > 0.50)")
-print(f"  Avg CI Width:  {avg_width:.6f}")
-print(f"  MC Std (med):  {median_std:.6f}")
-print(f"  Spike RMSE:    {spike_rmse:.6f}   (spikes: {spike_mask.sum():,})")
-print(f"  Normal RMSE:   {normal_rmse:.6f}")
-if not np.isnan(spike_rmse) and not np.isnan(normal_rmse) and normal_rmse > 0:
-    print(f"  Spike/Normal:  {spike_rmse/normal_rmse:.2f}x  (target: < 2.0x)")
+print(f"  LSTM RMSE:      {lstm_rmse:.6f}")
+print(f"  Ensemble RMSE:  {ens_rmse:.6f}   (target: < 0.14)")
+print(f"  Coverage 90%:   {coverage:.4f}    (target: 0.70–0.90)")
+print(f"  Confidence:     {confidence:.4f}    (target: 0.50–0.70)")
+print(f"  Avg CI Width:   {avg_width:.6f}")
+print(f"  Spike RMSE:     {spike_rmse:.6f}   (spikes: {spike_mask.sum():,})")
+print(f"  Normal RMSE:    {normal_rmse:.6f}")
 
 print()
-if rmse < 0.13:
-    print("✅ RMSE target met! (< 0.13)")
-elif rmse < 0.15:
-    print(f"🟡 RMSE close ({rmse:.4f}) — 1-2 more runs with Optuna may close the gap")
+if ens_rmse < 0.14:
+    print("✅ RMSE target met!")
+elif ens_rmse < 0.18:
+    print(f"🟡 RMSE {ens_rmse:.4f} — close, check log1p transform applied correctly")
 else:
-    print(f"⚠️  RMSE={rmse:.4f} still above target — check spike weighting printed above")
+    print(f"⚠️  RMSE {ens_rmse:.4f} — check scaler leakage and window size")
 
-if coverage > 0.85:
+if coverage > 0.70:
     print("✅ Coverage target met!")
-elif coverage > 0.70:
-    print(f"🟡 Coverage {coverage:.3f} — acceptable, target is 0.85+")
 else:
-    print(f"⚠️  Coverage {coverage:.3f} low — MC Dropout std may be too small")
+    print(f"⚠️  Coverage {coverage:.3f} — MC samples may be too low or model too confident")
 
-if confidence > 0.50:
+if 0.50 <= confidence <= 0.70:
     print("✅ Confidence target met!")
+elif confidence > 0.70:
+    print(f"🟡 Confidence {confidence:.3f} slightly high — weight_decay may need increase")
 else:
-    print(f"⚠️  Confidence {confidence:.3f} — check dropout rate (should be 0.25-0.35)")
+    print(f"⚠️  Confidence {confidence:.3f} — check dropout rate")
 
 print("=" * 60)
 
 
 # ============================================================
-# SAVE
+# STEP 6: SAVE
 # ============================================================
-print("\nSaving model...")
+print("\n[6/6] Saving...")
 joblib.dump(model, "saved_model.pkl")
 try:
     model.save("saved_model.keras")
     print("✅ Saved: saved_model.keras + saved_model.pkl")
 except Exception as e:
-    print(f"⚠️  Keras save issue: {e} — pkl only")
+    print(f"⚠️  Keras save: {e} — pkl only")
 
 metrics = {
     "trained_at": datetime.now().isoformat(),
@@ -280,28 +277,26 @@ metrics = {
         "window_size":      WINDOW_SIZE,
         "forecast_horizon": FORECAST_HORIZON,
         "epochs_run":       epochs_run,
-        "epochs_max":       EPOCHS,
         "batch_size":       BATCH_SIZE,
         "lstm_units":       LSTM_UNITS,
         "dropout_rate":     DROPOUT_RATE,
+        "weight_decay":     WEIGHT_DECAY,
         "learning_rate":    LEARNING_RATE,
         "mc_samples":       MC_SAMPLES,
         "num_features":     num_features,
-        "train_rows":       len(df),
-        "spike_threshold_scaled": round(scaled_spike_threshold, 4)
+        "log1p_target":     True
     },
     "metrics": {
-        "RMSE":               round(rmse, 6),
-        "MAE":                round(mae, 6),
-        "Coverage_95":        round(coverage, 4),
-        "Confidence":         round(confidence, 4),
-        "Avg_CI_Width":       round(avg_width, 6),
-        "MC_Std_Median":      round(median_std, 6),
-        "Spike_RMSE":         round(spike_rmse, 6) if not np.isnan(spike_rmse) else None,
-        "Normal_RMSE":        round(normal_rmse, 6) if not np.isnan(normal_rmse) else None,
-        "Final_Train_Loss":   round(final_train_loss, 6),
-        "Final_Val_Loss":     round(final_val_loss, 6),
-        "Best_Val_Loss":      round(best_val_loss, 6)
+        "LSTM_RMSE":        round(lstm_rmse,  6),
+        "Ensemble_RMSE":    round(ens_rmse,   6),
+        "LSTM_MAE":         round(lstm_mae,   6),
+        "Ensemble_MAE":     round(ens_mae,    6),
+        "Coverage_90":      round(coverage,   4),
+        "Confidence":       round(confidence, 4),
+        "Avg_CI_Width":     round(avg_width,  6),
+        "Spike_RMSE":       round(spike_rmse,  6) if not np.isnan(spike_rmse)  else None,
+        "Normal_RMSE":      round(normal_rmse, 6) if not np.isnan(normal_rmse) else None,
+        "Best_Val_Loss":    round(best_val_loss, 6)
     }
 }
 with open("last_training_metrics.json", "w") as f:

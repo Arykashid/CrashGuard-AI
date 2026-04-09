@@ -1,29 +1,16 @@
-# -*- coding: utf-8 -*-
 """
-evaluate.py -- CrashGuard AI Evaluation
-SPEED FIXES:
-  1. ARIMA limited to 2000 points max
-  2. ARIMA order search reduced to 6 combinations (p=[1,2,3], d=[1], q=[0,1])
-  3. run_prophet=False by default
+evaluate.py — CrashGuard AI Evaluation
 
-CALIBRATION FIX (Coverage 0.06 → ~0.95):
-  ROOT CAUSE: mc_std from MC Dropout only captures EPISTEMIC uncertainty
-  (model uncertainty from dropout). It does NOT capture ALEATORIC uncertainty
-  (irreducible noise in the data).
+FIXES in this version:
+  1. mc_dropout_predict() unpacks 4 values: mean, std, lower, upper
+  2. Coverage uses quantile-based CI (lower, upper) from mc_dropout_predict
+     instead of ±1.96*std — correct for non-Gaussian CPU distributions
+  3. log1p inverse transform applied before metric computation
+  4. total_std computation preserved for calibration diagram
 
-  A 95% CI must cover 95% of TRUE values — this requires TOTAL predictive
-  uncertainty = sqrt(epistemic² + aleatoric²).
-
-  Fix: total_std = sqrt(mc_std² + residual_std²)
-  where residual_std = std of (true - pred) on the test set.
-
-  This is mathematically correct. Reference: Kendall & Gal (2017),
-  "What Uncertainties Do We Need in Bayesian Deep Learning for Computer Vision?"
-
-RESULT:
-  Coverage 0.06 → ~0.90–0.95
-  ECE 0.426  → ~0.03–0.07
-  Evaluation: 3+ hours → under 10 minutes
+SPEED:
+  - ARIMA limited to 2000 points, 6 order combinations (~10 min total)
+  - Prophet disabled by default (run_prophet=False)
 """
 
 import numpy as np
@@ -40,7 +27,7 @@ from scipy.stats import t, norm
 import warnings
 warnings.filterwarnings("ignore")
 
-from lstm_model import predict, mc_dropout_predict
+from lstm_model import predict, mc_dropout_predict, inverse_log1p
 
 
 # =============================================
@@ -57,24 +44,6 @@ def calculate_metrics(y_true, y_pred):
 # =============================================
 def compute_reliability_diagram(y_true, mean_pred, total_std,
                                  n_bins=10, save_path="calibration_diagram.png"):
-    """
-    Reliability diagram for probabilistic forecasts.
-
-    Args:
-        y_true:     ground truth values
-        mean_pred:  predicted mean values
-        total_std:  TOTAL predictive std = sqrt(epistemic² + aleatoric²)
-                    This is NOT just mc_std — see evaluate_model() for how
-                    this is computed correctly.
-
-    HOW IT WORKS:
-        For 10 confidence levels (10%, 20%, ..., 100%):
-          1. Compute the CI at that confidence level using total_std
-          2. Count what fraction of y_true actually fell inside
-          3. Plot: predicted confidence (x) vs actual coverage (y)
-
-        Perfect calibration = diagonal line from (0,0) to (1,1)
-    """
     confidence_levels = np.linspace(0.1, 1.0, n_bins)
     actual_coverages  = []
 
@@ -86,16 +55,12 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
         actual_coverages.append(float(inside))
 
     actual_coverages = np.array(actual_coverages)
+    ece              = float(np.mean(np.abs(confidence_levels - actual_coverages)))
 
-    # ECE
-    ece = float(np.mean(np.abs(confidence_levels - actual_coverages)))
-
-    # Sharpness — average 95% CI width
     z95       = norm.ppf(0.975)
     ci_widths = 2 * z95 * total_std
     sharpness = float(np.mean(ci_widths))
 
-    # Calibration quality label
     if ece < 0.05:
         quality = "Well calibrated"
     elif ece < 0.10:
@@ -103,11 +68,9 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
     else:
         quality = "Poor calibration"
 
-    # ── Plot ──────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     fig.patch.set_facecolor("#0a0e1a")
 
-    # Left: Reliability diagram
     ax1 = axes[0]
     ax1.set_facecolor("#111827")
     ax1.plot([0, 1], [0, 1], color="#64748b", linewidth=1.5,
@@ -122,7 +85,7 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
     ax1.fill_between(confidence_levels, confidence_levels, actual_coverages,
                      alpha=0.15, color="#22c55e")
     ax1.set_xlabel("Predicted confidence level", color="#94a3b8", fontsize=11)
-    ax1.set_ylabel("Actual coverage (fraction inside CI)", color="#94a3b8", fontsize=11)
+    ax1.set_ylabel("Actual coverage", color="#94a3b8", fontsize=11)
     ax1.set_title("Reliability Diagram", color="white", fontsize=13, fontweight="bold")
     ax1.set_xlim(0, 1)
     ax1.set_ylim(0, 1)
@@ -137,7 +100,6 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
              color="#22c55e" if ece < 0.05 else "#f59e0b",
              fontsize=10, fontweight="bold")
 
-    # Right: Sharpness — CI Width Distribution
     ax2 = axes[1]
     ax2.set_facecolor("#111827")
     ax2.hist(ci_widths, bins=40, color="#3b82f6", alpha=0.8, edgecolor="#1e293b")
@@ -153,16 +115,12 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
     ax2.grid(True, color="#1e293b", linewidth=0.5, axis="y")
     ax2.legend(facecolor="#1a1f35", edgecolor="#2d3748",
                labelcolor="#e2e8f0", fontsize=9)
-    ax2.text(0.05, 0.92,
-             f"Sharpness = {sharpness:.4f}\n(narrower is better if calibrated)",
-             transform=ax2.transAxes, color="#94a3b8", fontsize=9)
 
-    plt.suptitle("CrashGuard AI -- Uncertainty Calibration Analysis",
+    plt.suptitle("CrashGuard AI — Uncertainty Calibration Analysis",
                  color="white", fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
-
-    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path)
-                else ".", exist_ok=True)
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".",
+                exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="#0a0e1a")
     plt.close()
     print(f"  Calibration diagram saved: {save_path}")
@@ -173,7 +131,7 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
         "ECE":                   ece,
         "ECE_quality":           quality,
         "Sharpness":             sharpness,
-        "Coverage_95":           float(actual_coverages[8]),   # index 8 = 90% level ≈ 95% CI
+        "Coverage_95":           float(actual_coverages[8]),
         "diagram_path":          save_path,
     }
 
@@ -191,34 +149,22 @@ def naive_forecast(y):
 def moving_average_forecast(y, window=5):
     preds = []
     for i in range(len(y)):
-        preds.append(
-            np.mean(y[max(0, i - window):i + 1] if i > 0 else [y[0]])
-        )
+        preds.append(np.mean(y[max(0, i - window):i + 1] if i > 0 else [y[0]]))
     return np.array(preds)
 
 
 # =============================================
-# FAST ARIMA (2000 points, 6 combinations)
+# FAST ARIMA
 # =============================================
 def arima_forecast_walkforward(y, max_train=2000, order=None):
-    """
-    FAST walk-forward ARIMA.
-    - Capped at 2000 points (30x faster than full dataset)
-    - Only 6 order combinations instead of 48 (8x faster)
-    - Total speedup: ~240x
-    - Quality impact on LSTM metrics: ZERO
-    """
-    # Limit to 2000 points
     arima_data = y[:2000] if len(y) > 2000 else y
     n_points   = len(arima_data)
     print(f"  Walk-forward ARIMA on {n_points} points (capped at 2000 for speed)...")
 
-    # 6 order combinations only: p=[1,2,3], d=[1], q=[0,1]
     if order is None:
         try:
             train_sample = arima_data[:min(300, n_points // 2)]
             best_aic, best_order = np.inf, (1, 1, 0)
-
             for p in [1, 2, 3]:
                 for q in [0, 1]:
                     try:
@@ -227,12 +173,10 @@ def arima_forecast_walkforward(y, max_train=2000, order=None):
                             best_aic, best_order = aic, (p, 1, q)
                     except Exception:
                         continue
-
             order = best_order
-            print(f"  ARIMA best order (AIC): {order}")
+            print(f"  ARIMA best order: {order}")
         except Exception:
             order = (1, 1, 0)
-            print(f"  ARIMA order search failed, using fallback: {order}")
 
     preds, history = [], list(arima_data[:max_train])
     for i in range(n_points):
@@ -247,12 +191,9 @@ def arima_forecast_walkforward(y, max_train=2000, order=None):
             print(f"    ARIMA step {i}/{n_points}")
 
     arima_preds_short = np.array(preds)
-
-    # Extend to full length if needed
     if len(y) > 2000:
-        extension = np.full(len(y) - 2000, arima_preds_short[-1])
+        extension        = np.full(len(y) - 2000, arima_preds_short[-1])
         arima_preds_full = np.concatenate([arima_preds_short, extension])
-        print(f"  ARIMA extended from {n_points} to {len(y)} points")
     else:
         arima_preds_full = arima_preds_short
 
@@ -261,7 +202,7 @@ def arima_forecast_walkforward(y, max_train=2000, order=None):
 
 
 # =============================================
-# PROPHET BASELINE (unchanged, slow, optional)
+# PROPHET
 # =============================================
 def prophet_forecast_walkforward(y, max_train=3000):
     try:
@@ -270,12 +211,10 @@ def prophet_forecast_walkforward(y, max_train=3000):
         logging.getLogger("prophet").setLevel(logging.WARNING)
         logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
     except ImportError:
-        print("  Prophet not installed. pip install prophet")
+        print("  Prophet not installed.")
         return naive_forecast(y), False
 
     import pandas as pd
-    print(f"  Walk-forward Prophet on {len(y)} points (refit every 50 steps)...")
-
     REFIT_EVERY, preds, history, prophet_model = 50, [], list(y[:max_train]), None
 
     for i in range(len(y)):
@@ -283,8 +222,7 @@ def prophet_forecast_walkforward(y, max_train=3000):
             try:
                 window     = history[-max_train:]
                 df_prophet = pd.DataFrame({
-                    "ds": pd.date_range(start="2024-01-01",
-                                        periods=len(window), freq="5s"),
+                    "ds": pd.date_range(start="2024-01-01", periods=len(window), freq="5s"),
                     "y":  window
                 })
                 prophet_model = Prophet(
@@ -297,43 +235,33 @@ def prophet_forecast_walkforward(y, max_train=3000):
                 preds.append(history[-1] if history else 0.0)
                 history.append(float(y[i]))
                 continue
-
         try:
-            last_ds  = pd.Timestamp("2024-01-01") + pd.Timedelta(
-                seconds=5 * len(history))
+            last_ds  = pd.Timestamp("2024-01-01") + pd.Timedelta(seconds=5 * len(history))
             forecast = prophet_model.predict(pd.DataFrame({"ds": [last_ds]}))
             pred     = float(np.clip(forecast["yhat"].values[0], 0.0, 1.0))
         except Exception:
             pred = history[-1] if history else 0.0
-
         preds.append(pred)
         history.append(float(y[i]))
-        if i % 500 == 0 and i > 0:
-            print(f"    Prophet step {i}/{len(y)}")
 
-    print("  Prophet complete.")
     return np.array(preds), True
 
 
 def get_prophet_verdict(lstm_rmse, prophet_rmse, dm_pval, prophet_success):
     if not prophet_success:
-        return "Prophet not available (pip install prophet)"
+        return "Prophet not available"
     if lstm_rmse < prophet_rmse:
         pct = (prophet_rmse - lstm_rmse) / prophet_rmse * 100
         sig = "statistically significant" if dm_pval < 0.05 else "not statistically significant"
-        return (f"LSTM outperforms Facebook Prophet by {pct:.1f}% "
-                f"(RMSE {lstm_rmse:.4f} vs {prophet_rmse:.4f}, "
-                f"DM p={dm_pval:.3f} -- {sig})")
-    else:
-        gap = (lstm_rmse - prophet_rmse) / prophet_rmse * 100
-        return (f"We identify Prophet as a strong baseline for this dataset "
-                f"(Prophet RMSE {prophet_rmse:.4f} vs LSTM {lstm_rmse:.4f}, gap={gap:.1f}%). "
-                f"LSTM provides uncertainty quantification and SHAP explainability "
-                f"that Prophet cannot offer.")
+        return (f"LSTM outperforms Prophet by {pct:.1f}% "
+                f"(RMSE {lstm_rmse:.4f} vs {prophet_rmse:.4f}, DM p={dm_pval:.3f} — {sig})")
+    gap = (lstm_rmse - prophet_rmse) / prophet_rmse * 100
+    return (f"Prophet baseline is strong (gap={gap:.1f}%). "
+            f"LSTM provides uncertainty quantification that Prophet cannot.")
 
 
 # =============================================
-# DIEBOLD-MARIANO TEST
+# DIEBOLD-MARIANO
 # =============================================
 def diebold_mariano_test(e1, e2):
     d      = e1 ** 2 - e2 ** 2
@@ -379,32 +307,16 @@ def walk_forward_validation(model, X_test, y_test, cpu_scaler, step=10):
 # =============================================
 def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
                    run_prophet=False,
-                   calibration_path="calibration_diagram.png"):
+                   calibration_path="calibration_diagram.png",
+                   use_log1p=True):
     """
-    Full evaluation pipeline with calibration fix.
+    Full evaluation pipeline.
 
-    THE COVERAGE FIX EXPLAINED (simple analogy):
-        Imagine you're predicting tomorrow's temperature.
-        Your thermometer has ±0.1°C measurement error (epistemic — model uncertainty).
-        But weather itself varies by ±5°C day-to-day (aleatoric — data noise).
-
-        If your 95% CI only uses the ±0.1°C thermometer error,
-        it will be WAY too narrow — almost no actual temperatures will fall inside.
-
-        Correct 95% CI must use TOTAL uncertainty:
-        total = sqrt(0.1² + 5²) ≈ 5°C
-
-        Same principle applies here:
-        mc_std  = epistemic (MC Dropout variance) — tiny, ~0.003
-        residual_std = aleatoric (actual prediction errors) — larger, ~0.05
-        total_std = sqrt(mc_std² + residual_std²) ≈ residual_std
-
-        This gives Coverage ~0.95 instead of ~0.06.
-
-    Reference: Kendall & Gal (2017), NeurIPS
+    FIX: mc_dropout_predict now returns 4 values.
+    Coverage uses quantile-based lower/upper CI — correct for non-Gaussian data.
+    log1p inverse applied before metric computation.
     """
 
-    # Build cpu_scaler if not provided
     if cpu_scaler is None:
         from sklearn.preprocessing import MinMaxScaler
         cpu_scaler                   = MinMaxScaler()
@@ -416,13 +328,16 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
         cpu_scaler.n_features_in_    = 1
         cpu_scaler.feature_names_in_ = None
 
-    # ── LSTM predictions ──────────────────────────────────────
+    # ── LSTM point predictions ────────────────────────────────
     print("\n[LSTM predictions...]")
     pred_scaled = predict(model, X_test)
-    pred_raw    = inverse_transform_cpu(cpu_scaler, pred_scaled)
-    true        = inverse_transform_cpu(cpu_scaler, y_test)
 
-    # Bias correction: center residuals at 0
+    if use_log1p:
+        pred_scaled = inverse_log1p(pred_scaled)
+
+    pred_raw  = inverse_transform_cpu(cpu_scaler, pred_scaled)
+    true      = inverse_transform_cpu(cpu_scaler, y_test)
+
     bias      = float(np.mean(true - pred_raw))
     pred      = np.clip(pred_raw + bias, 0.0, 1.0)
     residuals = true - pred
@@ -430,95 +345,94 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
     lstm_rmse, lstm_mae = calculate_metrics(true, pred)
     print(f"  LSTM RMSE: {lstm_rmse:.6f}  (bias corrected by {bias:+.6f})")
 
-    # ── MC Dropout — epistemic uncertainty ────────────────────
-    print("\n[MC Dropout uncertainty (50 samples)...]")
-    mc_mean_scaled, mc_std_scaled = mc_dropout_predict(
-        model, X_test, n_samples=50
+    # ── MC Dropout — FIX: unpack 4 values ────────────────────
+    print(f"\n[MC Dropout uncertainty ({100} samples)...]")
+    mc_mean_log, mc_std_log, lower_log, upper_log = mc_dropout_predict(
+        model, X_test, n_samples=100
     )
-    mc_mean   = inverse_transform_cpu(cpu_scaler, mc_mean_scaled) + bias
-    cpu_range = float(cpu_scaler.data_max_[0] - cpu_scaler.data_min_[0])
 
-    # Epistemic std (model uncertainty from MC Dropout)
-    mc_std_epistemic = mc_std_scaled.flatten() * cpu_range
+    if use_log1p:
+        mc_mean_scaled = inverse_log1p(mc_mean_log)
+        lower_scaled   = inverse_log1p(lower_log)
+        upper_scaled   = inverse_log1p(upper_log)
+    else:
+        mc_mean_scaled = mc_mean_log
+        lower_scaled   = lower_log
+        upper_scaled   = upper_log
+
+    cpu_range = float(cpu_scaler.data_max_[0] - cpu_scaler.data_min_[0])
+    mc_mean   = inverse_transform_cpu(cpu_scaler, mc_mean_scaled) + bias
+    lower_inv = np.clip(
+        inverse_transform_cpu(cpu_scaler, lower_scaled), 0.0, 1.0
+    )
+    upper_inv = np.clip(
+        inverse_transform_cpu(cpu_scaler, upper_scaled), 0.0, 1.0
+    )
+
+    mc_std_epistemic = mc_std_log.flatten() * cpu_range
     print(f"  MC std (epistemic) mean: {np.mean(mc_std_epistemic):.6f}")
 
-    # ── COVERAGE FIX: Total predictive uncertainty ────────────
-    # PROBLEM: mc_std_epistemic is tiny (~0.002–0.005)
-    # Because MC Dropout only captures model uncertainty,
-    # not the inherent noise in CPU data.
-    #
-    # A 95% CI must cover 95% of actual values.
-    # For that, the CI must be wide enough to capture
-    # both model uncertainty AND data noise.
-    #
-    # SOLUTION: Total predictive std = sqrt(epistemic² + aleatoric²)
-    # aleatoric_std = std of actual residuals (true - pred)
-    # This is the standard Bayesian deep learning decomposition.
-    # Reference: Kendall & Gal (2017), NeurIPS
+    # ── Total std for calibration diagram ────────────────────
     aleatoric_std = float(np.std(residuals))
     total_std     = np.sqrt(mc_std_epistemic ** 2 + aleatoric_std ** 2)
+    print(f"  Aleatoric std: {aleatoric_std:.6f}")
+    print(f"  Total std:     {np.mean(total_std):.6f}")
 
-    print(f"  Aleatoric std (residuals): {aleatoric_std:.6f}")
-    print(f"  Total std (epistemic + aleatoric): {np.mean(total_std):.6f}")
-
-    # Confidence score: based on how narrow total uncertainty is
     avg_total_std = float(np.mean(total_std))
     confidence    = float(np.clip(np.exp(-avg_total_std / 0.15), 0.05, 0.95))
 
-    # ── Calibration metrics using TOTAL std ───────────────────
-    print("\n[Calibration analysis (using total predictive uncertainty)...]")
+    # ── Coverage — FIX: quantile-based ───────────────────────
+    # lower_inv and upper_inv are 5th/95th percentile of MC samples
+    # not ±1.96*std — correct for heavy-tailed CPU distributions
+    coverage = float(np.mean((true >= lower_inv) & (true <= upper_inv)))
+    avg_width = float(np.mean(upper_inv - lower_inv))
+    print(f"  Coverage (quantile-based): {coverage:.4f}")
+
+    # ── Calibration metrics ───────────────────────────────────
+    print("\n[Calibration analysis...]")
     calibration = compute_reliability_diagram(
         y_true    = true,
         mean_pred = mc_mean,
-        total_std = total_std,   # FIX: was mc_std (epistemic only) → now total
+        total_std = total_std,
         n_bins    = 10,
         save_path = calibration_path
     )
 
-    coverage  = calibration["Coverage_95"]
     ece       = calibration["ECE"]
     sharpness = calibration["Sharpness"]
-
     print(f"  ECE:       {ece:.4f}  ({calibration['ECE_quality']})")
     print(f"  Sharpness: {sharpness:.4f}")
-    print(f"  Coverage:  {coverage:.4f}  ← should now be ~0.90–0.95")
+    print(f"  Coverage:  {coverage:.4f}")
 
-    # ── Baselines ──────────────────────────────────────────────
+    # ── Baselines ─────────────────────────────────────────────
     print("\n[Baselines...]")
     naive_pred            = naive_forecast(true)
     naive_rmse, naive_mae = calculate_metrics(true, naive_pred)
-    print(f"  Naive RMSE: {naive_rmse:.6f}")
 
     ma_pred         = moving_average_forecast(true)
     ma_rmse, ma_mae = calculate_metrics(true, ma_pred)
-    print(f"  MA RMSE:    {ma_rmse:.6f}")
 
-    # Fast ARIMA
-    print("\n[ARIMA baseline (fast mode: 2000 pts, 6 combos)...]")
+    print("\n[ARIMA baseline...]")
     arima_pred, arima_order = arima_forecast_walkforward(true)
     arima_rmse, arima_mae   = calculate_metrics(true, arima_pred)
     print(f"  ARIMA RMSE: {arima_rmse:.6f}  order={arima_order}")
 
-    # ── Prophet (disabled by default) ─────────────────────────
     prophet_pred    = None
     prophet_rmse    = float("nan")
     prophet_mae     = float("nan")
     prophet_success = False
-    prophet_verdict = ("Prophet skipped (run_prophet=False for speed). "
-                       "Set run_prophet=True to enable.")
+    prophet_verdict = "Prophet skipped (run_prophet=False). Set run_prophet=True to enable."
 
     if run_prophet:
-        print("\n[Prophet baseline (slow — 20-30 min)...]")
+        print("\n[Prophet baseline...]")
         prophet_pred, prophet_success = prophet_forecast_walkforward(true)
         if prophet_success:
             prophet_rmse, prophet_mae = calculate_metrics(true, prophet_pred)
 
-    # ── Statistical diagnostics ────────────────────────────────
+    # ── Diagnostics ───────────────────────────────────────────
     print("\n[Diagnostics...]")
     lb_pvalue       = ljung_box_test(residuals)
-    wf_mean, wf_std = walk_forward_validation(
-        model, X_test, y_test, cpu_scaler
-    )
+    wf_mean, wf_std = walk_forward_validation(model, X_test, y_test, cpu_scaler)
 
     lstm_errors  = true - pred
     arima_errors = true - arima_pred
@@ -534,26 +448,15 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
             lstm_rmse, prophet_rmse, dm_pval_prophet, prophet_success
         )
 
-    # ── Print summary ─────────────────────────────────────────
     beats_arima = "✅ YES" if lstm_rmse < arima_rmse else "❌ NO"
     print(f"\n{'='*60}")
-    print(f"  LSTM RMSE:          {lstm_rmse:.6f}")
-    print(f"  Naive RMSE:         {naive_rmse:.6f}")
-    print(f"  MA RMSE:            {ma_rmse:.6f}")
-    print(f"  ARIMA RMSE:         {arima_rmse:.6f}")
-    print(f"  LSTM beats ARIMA:   {beats_arima}")
-    if prophet_success:
-        print(f"  Prophet RMSE:       {prophet_rmse:.6f}")
-    print(f"  ECE:                {ece:.4f}  ({calibration['ECE_quality']})")
-    print(f"  Sharpness:          {sharpness:.4f}")
-    print(f"  Coverage 95%:       {coverage:.4f}")
-    print(f"  Confidence:         {confidence:.4f}")
-    print(f"  Epistemic std:      {np.mean(mc_std_epistemic):.6f}")
-    print(f"  Aleatoric std:      {aleatoric_std:.6f}")
-    print(f"  Total std:          {np.mean(total_std):.6f}")
-    print(f"  Walk-Forward RMSE:  {wf_mean:.6f} ± {wf_std:.6f}")
-    print(f"  DM p-value:         {dm_pval:.6f} "
-          f"{'(LSTM significantly better)' if dm_pval < 0.05 else ''}")
+    print(f"  LSTM RMSE:        {lstm_rmse:.6f}")
+    print(f"  ARIMA RMSE:       {arima_rmse:.6f}")
+    print(f"  LSTM beats ARIMA: {beats_arima}")
+    print(f"  ECE:              {ece:.4f}  ({calibration['ECE_quality']})")
+    print(f"  Coverage 90%:     {coverage:.4f}")
+    print(f"  Confidence:       {confidence:.4f}")
+    print(f"  DM p-value:       {dm_pval:.6f}")
     print(f"{'='*60}\n")
 
     return {
@@ -602,8 +505,10 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
             "pred":              pred,
             "pred_raw":          pred_raw,
             "mc_mean":           mc_mean,
-            "mc_std":            total_std,          # total uncertainty for CI bands
-            "mc_std_epistemic":  mc_std_epistemic,   # epistemic only (for research)
+            "mc_std":            total_std,
+            "mc_std_epistemic":  mc_std_epistemic,
+            "lower":             lower_inv,         # quantile-based lower CI
+            "upper":             upper_inv,         # quantile-based upper CI
             "residuals":         residuals,
             "arima_pred":        arima_pred,
             "prophet_pred":      prophet_pred,
