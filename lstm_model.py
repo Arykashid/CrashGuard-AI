@@ -76,8 +76,8 @@ def build_lstm_model(
     window_size,
     num_features,
     forecast_horizon=1,
-    lstm_units=(128, 64),
-    dropout_rate=0.30,
+    lstm_units=(256, 128),
+    dropout_rate=0.20,
     learning_rate=0.001,
     weight_decay=1e-4         # FIX: L2 regularization → reduces overconfidence
 ):

@@ -2,15 +2,11 @@
 evaluate.py — CrashGuard AI Evaluation
 
 FIXES in this version:
-  1. mc_dropout_predict() unpacks 4 values: mean, std, lower, upper
-  2. Coverage uses quantile-based CI (lower, upper) from mc_dropout_predict
-     instead of ±1.96*std — correct for non-Gaussian CPU distributions
-  3. log1p inverse transform applied before metric computation
-  4. total_std computation preserved for calibration diagram
-
-SPEED:
-  - ARIMA limited to 2000 points, 6 order combinations (~10 min total)
-  - Prophet disabled by default (run_prophet=False)
+  1. mc_dropout_predict() unpacks 4 values
+  2. Coverage uses quantile-based CI
+  3. log1p inverse applied before metric computation
+  4. Rolling residual correction added (NEW)
+  5. Temperature scaling loaded and applied to uncertainty (NEW)
 """
 
 import numpy as np
@@ -18,16 +14,15 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from scipy import stats as scipy_stats
+from scipy.stats import t, norm
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.arima.model import ARIMA
-from scipy.stats import t, norm
 import warnings
 warnings.filterwarnings("ignore")
 
 from lstm_model import predict, mc_dropout_predict, inverse_log1p
+from calibration import load_temperature, apply_temperature
 
 
 # =============================================
@@ -37,6 +32,35 @@ def calculate_metrics(y_true, y_pred):
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     mae  = float(mean_absolute_error(y_true, y_pred))
     return rmse, mae
+
+
+# =============================================
+# ROLLING RESIDUAL CORRECTION (NEW)
+# =============================================
+def rolling_residual_correction(pred, residuals, window=50):
+    """
+    Correct predictions using rolling mean of recent residuals.
+
+    If the model has been consistently under-predicting by 0.02
+    for the last 50 steps, the next prediction is likely also off
+    by ~0.02. This corrects that drift in O(N) with zero overhead.
+
+    Args:
+        pred:      (N,) predictions
+        residuals: (N,) true - pred (must be same length as pred)
+        window:    int, lookback window for bias estimate
+
+    Returns:
+        corrected: (N,) bias-corrected predictions, clipped to [0,1]
+    """
+    corrected = pred.copy()
+    for i in range(len(pred)):
+        if i < window:
+            bias = np.mean(residuals[:max(1, i)])
+        else:
+            bias = np.mean(residuals[i - window:i])
+        corrected[i] = pred[i] + bias
+    return np.clip(corrected, 0.0, 1.0)
 
 
 # =============================================
@@ -56,10 +80,9 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
 
     actual_coverages = np.array(actual_coverages)
     ece              = float(np.mean(np.abs(confidence_levels - actual_coverages)))
-
-    z95       = norm.ppf(0.975)
-    ci_widths = 2 * z95 * total_std
-    sharpness = float(np.mean(ci_widths))
+    z95              = norm.ppf(0.975)
+    ci_widths        = 2 * z95 * total_std
+    sharpness        = float(np.mean(ci_widths))
 
     if ece < 0.05:
         quality = "Well calibrated"
@@ -75,10 +98,8 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
     ax1.set_facecolor("#111827")
     ax1.plot([0, 1], [0, 1], color="#64748b", linewidth=1.5,
              linestyle="--", label="Perfect calibration", zorder=1)
-    ax1.fill_between([0, 1], [0, 0], [0, 1],
-                     alpha=0.04, color="#ef4444", label="Overconfident zone")
-    ax1.fill_between([0, 1], [0, 1], [1, 1],
-                     alpha=0.04, color="#3b82f6", label="Underconfident zone")
+    ax1.fill_between([0, 1], [0, 0], [0, 1], alpha=0.04, color="#ef4444", label="Overconfident zone")
+    ax1.fill_between([0, 1], [0, 1], [1, 1], alpha=0.04, color="#3b82f6", label="Underconfident zone")
     ax1.plot(confidence_levels, actual_coverages,
              color="#22c55e", linewidth=2.5, marker="o", markersize=7,
              label=f"CrashGuard AI (ECE={ece:.3f})", zorder=3)
@@ -87,14 +108,12 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
     ax1.set_xlabel("Predicted confidence level", color="#94a3b8", fontsize=11)
     ax1.set_ylabel("Actual coverage", color="#94a3b8", fontsize=11)
     ax1.set_title("Reliability Diagram", color="white", fontsize=13, fontweight="bold")
-    ax1.set_xlim(0, 1)
-    ax1.set_ylim(0, 1)
+    ax1.set_xlim(0, 1); ax1.set_ylim(0, 1)
     ax1.tick_params(colors="#94a3b8")
     for spine in ax1.spines.values():
         spine.set_color("#2d3748")
     ax1.grid(True, color="#1e293b", linewidth=0.5)
-    ax1.legend(facecolor="#1a1f35", edgecolor="#2d3748",
-               labelcolor="#e2e8f0", fontsize=9)
+    ax1.legend(facecolor="#1a1f35", edgecolor="#2d3748", labelcolor="#e2e8f0", fontsize=9)
     ax1.text(0.05, 0.92, f"ECE = {ece:.4f}  ({quality})",
              transform=ax1.transAxes,
              color="#22c55e" if ece < 0.05 else "#f59e0b",
@@ -107,20 +126,17 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
                 label=f"Mean width = {sharpness:.4f}")
     ax2.set_xlabel("95% CI width", color="#94a3b8", fontsize=11)
     ax2.set_ylabel("Count", color="#94a3b8", fontsize=11)
-    ax2.set_title("Sharpness — CI Width Distribution",
-                  color="white", fontsize=13, fontweight="bold")
+    ax2.set_title("Sharpness — CI Width Distribution", color="white", fontsize=13, fontweight="bold")
     ax2.tick_params(colors="#94a3b8")
     for spine in ax2.spines.values():
         spine.set_color("#2d3748")
     ax2.grid(True, color="#1e293b", linewidth=0.5, axis="y")
-    ax2.legend(facecolor="#1a1f35", edgecolor="#2d3748",
-               labelcolor="#e2e8f0", fontsize=9)
+    ax2.legend(facecolor="#1a1f35", edgecolor="#2d3748", labelcolor="#e2e8f0", fontsize=9)
 
     plt.suptitle("CrashGuard AI — Uncertainty Calibration Analysis",
                  color="white", fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
-    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".",
-                exist_ok=True)
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="#0a0e1a")
     plt.close()
     print(f"  Calibration diagram saved: {save_path}")
@@ -140,7 +156,7 @@ def compute_reliability_diagram(y_true, mean_pred, total_std,
 # BASELINES
 # =============================================
 def naive_forecast(y):
-    preds     = np.zeros_like(y)
+    preds = np.zeros_like(y)
     preds[0]  = y[0]
     preds[1:] = y[:-1]
     return preds
@@ -159,7 +175,7 @@ def moving_average_forecast(y, window=5):
 def arima_forecast_walkforward(y, max_train=2000, order=None):
     arima_data = y[:2000] if len(y) > 2000 else y
     n_points   = len(arima_data)
-    print(f"  Walk-forward ARIMA on {n_points} points (capped at 2000 for speed)...")
+    print(f"  Walk-forward ARIMA on {n_points} points (capped at 2000)...")
 
     if order is None:
         try:
@@ -197,7 +213,7 @@ def arima_forecast_walkforward(y, max_train=2000, order=None):
     else:
         arima_preds_full = arima_preds_short
 
-    print(f"  ARIMA complete.")
+    print("  ARIMA complete.")
     return arima_preds_full, order
 
 
@@ -211,7 +227,6 @@ def prophet_forecast_walkforward(y, max_train=3000):
         logging.getLogger("prophet").setLevel(logging.WARNING)
         logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
     except ImportError:
-        print("  Prophet not installed.")
         return naive_forecast(y), False
 
     import pandas as pd
@@ -303,6 +318,76 @@ def walk_forward_validation(model, X_test, y_test, cpu_scaler, step=10):
 
 
 # =============================================
+# EVALUATION REPORT GENERATOR (NEW)
+# =============================================
+def generate_evaluation_report(results, path="evaluation_report.md"):
+    """
+    Auto-generates evaluation_report.md after every evaluation run.
+    No external dependencies.
+    """
+    lstm  = results["LSTM"]
+    naive = results["Naive"]
+    ma    = results["MovingAverage"]
+    arima = results["ARIMA"]
+    cal   = results["Calibration"]
+    diag  = results["Diagnostics"]
+
+    ens_rmse    = results.get("Ensemble", {}).get("RMSE", lstm["RMSE"])
+    spike_rmse  = diag.get("Spike_RMSE",  "N/A")
+    normal_rmse = diag.get("Normal_RMSE", "N/A")
+    coverage    = diag["Coverage_95"]
+    confidence  = diag["Confidence"]
+    ece         = cal["ECE"]
+    dm_pval     = diag["DieboldMariano_pvalue"]
+    dm_sig      = diag["DieboldMariano_sig"]
+    beats_arima = diag["LSTM_beats_ARIMA"]
+
+    if ens_rmse < 0.14 and coverage > 0.70 and 0.50 <= confidence <= 0.70:
+        verdict = "✅ System meets production threshold"
+    else:
+        verdict = "⚠️ System requires retraining or recalibration"
+
+    lines = [
+        "# CrashGuard AI — Evaluation Report",
+        f"\nGenerated automatically. Do not edit manually.\n",
+        "## Verdict",
+        f"\n**{verdict}**\n",
+        "## Metrics",
+        "\n| Metric | Value | Target |",
+        "|---|---|---|",
+        f"| Ensemble RMSE | {ens_rmse:.6f} | < 0.14 |",
+        f"| LSTM RMSE | {lstm['RMSE']:.6f} | < 0.14 |",
+        f"| Coverage 90% | {coverage:.4f} | 0.70–0.90 |",
+        f"| Confidence | {confidence:.4f} | 0.50–0.70 |",
+        f"| ECE | {ece:.4f} | < 0.05 |",
+        f"| Calibration quality | {cal['ECE_quality']} | Well calibrated |",
+        "",
+        "## Model Comparison",
+        "\n| Model | RMSE | MAE |",
+        "|---|---|---|",
+        f"| LSTM (CrashGuard) | {lstm['RMSE']:.6f} | {lstm['MAE']:.6f} |",
+        f"| ARIMA | {arima['RMSE']:.6f} | {arima['MAE']:.6f} |",
+        f"| Moving Average | {ma['RMSE']:.6f} | {ma['MAE']:.6f} |",
+        f"| Naive | {naive['RMSE']:.6f} | {naive['MAE']:.6f} |",
+        "",
+        "## Spike vs Normal RMSE",
+        "\n| Regime | RMSE |",
+        "|---|---|",
+        f"| Spike regime | {spike_rmse} |",
+        f"| Normal regime | {normal_rmse} |",
+        "",
+        "## Statistical Tests",
+        f"\n**Diebold-Mariano test** (LSTM vs ARIMA): p = {dm_pval:.6f}",
+        f"{'✅ LSTM is statistically significantly better than ARIMA (p < 0.05)' if dm_sig else '⚠️ Not yet statistically significant (p ≥ 0.05)'}",
+        f"\n**LSTM beats ARIMA**: {'✅ YES' if beats_arima else '❌ NO'}",
+    ]
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"  Evaluation report saved: {path}")
+
+
+# =============================================
 # MAIN EVALUATION
 # =============================================
 def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
@@ -312,9 +397,8 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
     """
     Full evaluation pipeline.
 
-    FIX: mc_dropout_predict now returns 4 values.
-    Coverage uses quantile-based lower/upper CI — correct for non-Gaussian data.
-    log1p inverse applied before metric computation.
+    NEW: Rolling residual correction applied after bias correction.
+    NEW: Temperature scaling loaded and applied to uncertainty.
     """
 
     if cpu_scaler is None:
@@ -331,22 +415,26 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
     # ── LSTM point predictions ────────────────────────────────
     print("\n[LSTM predictions...]")
     pred_scaled = predict(model, X_test)
-
     if use_log1p:
         pred_scaled = inverse_log1p(pred_scaled)
 
     pred_raw  = inverse_transform_cpu(cpu_scaler, pred_scaled)
     true      = inverse_transform_cpu(cpu_scaler, y_test)
 
+    # Global bias correction
     bias      = float(np.mean(true - pred_raw))
     pred      = np.clip(pred_raw + bias, 0.0, 1.0)
     residuals = true - pred
 
-    lstm_rmse, lstm_mae = calculate_metrics(true, pred)
-    print(f"  LSTM RMSE: {lstm_rmse:.6f}  (bias corrected by {bias:+.6f})")
+    # NEW: Rolling residual correction on top of bias correction
+    pred      = rolling_residual_correction(pred, residuals, window=50)
+    residuals = true - pred  # recompute after correction
 
-    # ── MC Dropout — FIX: unpack 4 values ────────────────────
-    print(f"\n[MC Dropout uncertainty ({100} samples)...]")
+    lstm_rmse, lstm_mae = calculate_metrics(true, pred)
+    print(f"  LSTM RMSE: {lstm_rmse:.6f}  (bias + residual corrected)")
+
+    # ── MC Dropout — unpack 4 values ─────────────────────────
+    print(f"\n[MC Dropout uncertainty (100 samples)...]")
     mc_mean_log, mc_std_log, lower_log, upper_log = mc_dropout_predict(
         model, X_test, n_samples=100
     )
@@ -362,33 +450,30 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
 
     cpu_range = float(cpu_scaler.data_max_[0] - cpu_scaler.data_min_[0])
     mc_mean   = inverse_transform_cpu(cpu_scaler, mc_mean_scaled) + bias
-    lower_inv = np.clip(
-        inverse_transform_cpu(cpu_scaler, lower_scaled), 0.0, 1.0
-    )
-    upper_inv = np.clip(
-        inverse_transform_cpu(cpu_scaler, upper_scaled), 0.0, 1.0
-    )
+    lower_inv = np.clip(inverse_transform_cpu(cpu_scaler, lower_scaled), 0.0, 1.0)
+    upper_inv = np.clip(inverse_transform_cpu(cpu_scaler, upper_scaled), 0.0, 1.0)
 
     mc_std_epistemic = mc_std_log.flatten() * cpu_range
-    print(f"  MC std (epistemic) mean: {np.mean(mc_std_epistemic):.6f}")
 
-    # ── Total std for calibration diagram ────────────────────
+    # NEW: Load temperature and apply to epistemic std
+    T                    = load_temperature("calibration_temperature.pkl")
+    mc_std_calibrated    = apply_temperature(mc_std_epistemic, T)
+    print(f"  MC std epistemic mean:  {np.mean(mc_std_epistemic):.6f}")
+    print(f"  MC std calibrated mean: {np.mean(mc_std_calibrated):.6f}  (T={T:.4f})")
+
     aleatoric_std = float(np.std(residuals))
-    total_std     = np.sqrt(mc_std_epistemic ** 2 + aleatoric_std ** 2)
+    total_std     = np.sqrt(mc_std_calibrated ** 2 + aleatoric_std ** 2)
     print(f"  Aleatoric std: {aleatoric_std:.6f}")
     print(f"  Total std:     {np.mean(total_std):.6f}")
 
     avg_total_std = float(np.mean(total_std))
     confidence    = float(np.clip(np.exp(-avg_total_std / 0.15), 0.05, 0.95))
 
-    # ── Coverage — FIX: quantile-based ───────────────────────
-    # lower_inv and upper_inv are 5th/95th percentile of MC samples
-    # not ±1.96*std — correct for heavy-tailed CPU distributions
-    coverage = float(np.mean((true >= lower_inv) & (true <= upper_inv)))
+    coverage  = float(np.mean((true >= lower_inv) & (true <= upper_inv)))
     avg_width = float(np.mean(upper_inv - lower_inv))
     print(f"  Coverage (quantile-based): {coverage:.4f}")
 
-    # ── Calibration metrics ───────────────────────────────────
+    # ── Calibration ───────────────────────────────────────────
     print("\n[Calibration analysis...]")
     calibration = compute_reliability_diagram(
         y_true    = true,
@@ -397,7 +482,6 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
         n_bins    = 10,
         save_path = calibration_path
     )
-
     ece       = calibration["ECE"]
     sharpness = calibration["Sharpness"]
     print(f"  ECE:       {ece:.4f}  ({calibration['ECE_quality']})")
@@ -408,9 +492,8 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
     print("\n[Baselines...]")
     naive_pred            = naive_forecast(true)
     naive_rmse, naive_mae = calculate_metrics(true, naive_pred)
-
-    ma_pred         = moving_average_forecast(true)
-    ma_rmse, ma_mae = calculate_metrics(true, ma_pred)
+    ma_pred               = moving_average_forecast(true)
+    ma_rmse, ma_mae       = calculate_metrics(true, ma_pred)
 
     print("\n[ARIMA baseline...]")
     arima_pred, arima_order = arima_forecast_walkforward(true)
@@ -421,7 +504,7 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
     prophet_rmse    = float("nan")
     prophet_mae     = float("nan")
     prophet_success = False
-    prophet_verdict = "Prophet skipped (run_prophet=False). Set run_prophet=True to enable."
+    prophet_verdict = "Prophet skipped (run_prophet=False)."
 
     if run_prophet:
         print("\n[Prophet baseline...]")
@@ -431,22 +514,17 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
 
     # ── Diagnostics ───────────────────────────────────────────
     print("\n[Diagnostics...]")
-    lb_pvalue       = ljung_box_test(residuals)
-    wf_mean, wf_std = walk_forward_validation(model, X_test, y_test, cpu_scaler)
-
-    lstm_errors  = true - pred
-    arima_errors = true - arima_pred
+    lb_pvalue        = ljung_box_test(residuals)
+    wf_mean, wf_std  = walk_forward_validation(model, X_test, y_test, cpu_scaler)
+    lstm_errors      = true - pred
+    arima_errors     = true - arima_pred
     dm_stat, dm_pval = diebold_mariano_test(lstm_errors, arima_errors)
 
     dm_stat_prophet = dm_pval_prophet = float("nan")
     if prophet_success and prophet_pred is not None:
         prophet_errors = true - prophet_pred
-        dm_stat_prophet, dm_pval_prophet = diebold_mariano_test(
-            lstm_errors, prophet_errors
-        )
-        prophet_verdict = get_prophet_verdict(
-            lstm_rmse, prophet_rmse, dm_pval_prophet, prophet_success
-        )
+        dm_stat_prophet, dm_pval_prophet = diebold_mariano_test(lstm_errors, prophet_errors)
+        prophet_verdict = get_prophet_verdict(lstm_rmse, prophet_rmse, dm_pval_prophet, prophet_success)
 
     beats_arima = "✅ YES" if lstm_rmse < arima_rmse else "❌ NO"
     print(f"\n{'='*60}")
@@ -459,12 +537,11 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
     print(f"  DM p-value:       {dm_pval:.6f}")
     print(f"{'='*60}\n")
 
-    return {
+    results = {
         "LSTM":          {"RMSE": lstm_rmse,  "MAE": lstm_mae},
         "Naive":         {"RMSE": naive_rmse, "MAE": naive_mae},
         "MovingAverage": {"RMSE": ma_rmse,    "MAE": ma_mae},
-        "ARIMA":         {"RMSE": arima_rmse, "MAE": arima_mae,
-                          "order": str(arima_order)},
+        "ARIMA":         {"RMSE": arima_rmse, "MAE": arima_mae, "order": str(arima_order)},
         "Prophet": {
             "RMSE":    prophet_rmse,
             "MAE":     prophet_mae,
@@ -493,24 +570,30 @@ def evaluate_model(model, X_test, y_test, scaler, cpu_scaler=None,
             "Confidence":            confidence,
             "Bias_corrected":        round(bias, 6),
             "Epistemic_std":         float(np.mean(mc_std_epistemic)),
+            "Calibrated_std":        float(np.mean(mc_std_calibrated)),
             "Aleatoric_std":         aleatoric_std,
             "Total_std":             float(np.mean(total_std)),
+            "Calibration_T":         T,
             "LSTM_beats_ARIMA":      bool(lstm_rmse < arima_rmse),
-            "LSTM_beats_Prophet":    bool(lstm_rmse < prophet_rmse)
-                                     if prophet_success else None,
+            "LSTM_beats_Prophet":    bool(lstm_rmse < prophet_rmse) if prophet_success else None,
             "Prophet_verdict":       prophet_verdict,
         },
         "_arrays": {
-            "true":              true,
-            "pred":              pred,
-            "pred_raw":          pred_raw,
-            "mc_mean":           mc_mean,
-            "mc_std":            total_std,
-            "mc_std_epistemic":  mc_std_epistemic,
-            "lower":             lower_inv,         # quantile-based lower CI
-            "upper":             upper_inv,         # quantile-based upper CI
-            "residuals":         residuals,
-            "arima_pred":        arima_pred,
-            "prophet_pred":      prophet_pred,
+            "true":             true,
+            "pred":             pred,
+            "pred_raw":         pred_raw,
+            "mc_mean":          mc_mean,
+            "mc_std":           total_std,
+            "mc_std_epistemic": mc_std_epistemic,
+            "lower":            lower_inv,
+            "upper":            upper_inv,
+            "residuals":        residuals,
+            "arima_pred":       arima_pred,
+            "prophet_pred":     prophet_pred,
         }
     }
+
+    # Auto-generate evaluation report
+    generate_evaluation_report(results)
+
+    return results

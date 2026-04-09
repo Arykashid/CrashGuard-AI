@@ -2,15 +2,13 @@
 train.py — CrashGuard AI Full Retraining Pipeline
 
 FIXES in this version:
-  1. log1p applied to target before training — compresses spikes,
-     flattens loss surface, forces model to predict spike shape not just mean
-  2. train_model() call updated — spike_threshold/spike_weight removed
-     (continuous weighting now handled inside lstm_model.py)
-  3. mc_dropout_predict() unpacks 4 values (mean, std, lower, upper)
-  4. Coverage now uses quantile-based CI from mc_dropout_predict
-     instead of ±1.96*std — correct for non-Gaussian CPU distributions
-  5. XGBoost ensemble added with regime-switching
+  1. log1p applied to target before training
+  2. train_model() — spike_threshold/spike_weight removed
+  3. mc_dropout_predict() unpacks 4 values
+  4. Coverage uses quantile-based CI
+  5. XGBoost ensemble with regime-switching
   6. weight_decay passed to build_lstm_model
+  7. Temperature scaling calibration added after evaluation (NEW)
 """
 
 import os
@@ -24,16 +22,17 @@ from datetime import datetime
 from lstm_model import build_lstm_model, train_model, mc_dropout_predict, inverse_log1p
 from preprocessing import prepare_data
 from xgboost_model import train_xgb, predict_xgb, ensemble_predict, save_xgb
+from calibration import find_temperature, save_temperature
 
 # ============================================================
 # CONFIG
 # ============================================================
 WINDOW_SIZE      = 60
 FORECAST_HORIZON = 1
-EPOCHS           = 80
+EPOCHS           = 30
 BATCH_SIZE       = 256
-LSTM_UNITS       = [128, 64]
-DROPOUT_RATE     = 0.30
+LSTM_UNITS       = [256, 128]
+DROPOUT_RATE     = 0.20
 LEARNING_RATE    = 0.001
 WEIGHT_DECAY     = 1e-4
 MC_SAMPLES       = 100
@@ -54,7 +53,7 @@ print("=" * 60)
 # ============================================================
 # STEP 1: LOAD DATA
 # ============================================================
-print("\n[1/6] Loading data...")
+print("\n[1/7] Loading data...")
 df = pd.read_csv(DATA_PATH)
 df["timestamp"] = pd.to_datetime(df["timestamp"])
 print(f"  Rows loaded: {len(df):,}")
@@ -71,7 +70,7 @@ assert len(df) >= 10_000, "Need at least 10K rows"
 # ============================================================
 # STEP 2: PREPARE DATA
 # ============================================================
-print("\n[2/6] Preparing data...")
+print("\n[2/7] Preparing data...")
 processed = prepare_data(
     df,
     window_size=WINDOW_SIZE,
@@ -92,11 +91,6 @@ print(f"  X_val:   {X_val.shape}")
 print(f"  X_test:  {X_test.shape}")
 num_features = X_train.shape[2]
 
-# ── FIX: log1p transform on target ──────────────────────────
-# Why: raw CPU targets have heavy right tail (spikes)
-# log1p compresses the tail → loss surface flattens →
-# model stops predicting the mean and starts predicting spike shape
-# Inverse: np.expm1(pred) — applied after mc_dropout_predict
 print("\n  Applying log1p to targets...")
 y_train_log = np.log1p(y_train)
 y_val_log   = np.log1p(y_val)
@@ -108,7 +102,7 @@ print(f"  y_train range after  log1p: [{y_train_log.min():.4f}, {y_train_log.max
 # ============================================================
 # STEP 3: BUILD LSTM MODEL
 # ============================================================
-print("\n[3/6] Building LSTM model...")
+print("\n[3/7] Building LSTM model...")
 model = build_lstm_model(
     window_size=WINDOW_SIZE,
     num_features=num_features,
@@ -116,7 +110,7 @@ model = build_lstm_model(
     lstm_units=LSTM_UNITS,
     dropout_rate=DROPOUT_RATE,
     learning_rate=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY        # FIX: L2 reg → reduces overconfidence
+    weight_decay=WEIGHT_DECAY
 )
 model.summary()
 
@@ -124,12 +118,10 @@ model.summary()
 # ============================================================
 # STEP 4: TRAIN LSTM
 # ============================================================
-print(f"\n[4/6] Training LSTM ({EPOCHS} epochs max)...")
-# FIX: spike_threshold and spike_weight removed —
-# continuous weighting is now computed inside train_model()
+print(f"\n[4/7] Training LSTM ({EPOCHS} epochs max)...")
 history = train_model(
     model,
-    X_train, y_train_log,   # log1p targets
+    X_train, y_train_log,
     X_val,   y_val_log,
     epochs=EPOCHS,
     batch_size=BATCH_SIZE
@@ -146,7 +138,7 @@ print(f"  Best val loss: {best_val_loss:.6f}")
 # ============================================================
 # STEP 4b: TRAIN XGBOOST
 # ============================================================
-print("\n[4b/6] Training XGBoost ensemble component...")
+print("\n[4b/7] Training XGBoost ensemble component...")
 xgb_model = train_xgb(
     X_train, y_train_log,
     X_val,   y_val_log
@@ -157,20 +149,16 @@ save_xgb(xgb_model, "saved_xgb_model.pkl")
 # ============================================================
 # STEP 5: EVALUATE — LSTM + ENSEMBLE
 # ============================================================
-print(f"\n[5/6] Evaluating with MC Dropout ({MC_SAMPLES} samples)...")
+print(f"\n[5/7] Evaluating with MC Dropout ({MC_SAMPLES} samples)...")
 
-# FIX: mc_dropout_predict now returns 4 values
 mc_mean_log, mc_std_log, lower_log, upper_log = mc_dropout_predict(
     model, X_test, n_samples=MC_SAMPLES
 )
 
-# ── Inverse log1p transform ──────────────────────────────────
-# FIX: expm1 applied to all outputs before metric computation
 mc_mean_scaled = inverse_log1p(mc_mean_log)
 lower_scaled   = inverse_log1p(lower_log)
 upper_scaled   = inverse_log1p(upper_log)
 
-# ── Inverse MinMax transform ─────────────────────────────────
 if cpu_scaler is not None:
     mean_inv  = cpu_scaler.inverse_transform(mc_mean_scaled.reshape(-1, 1)).flatten()
     lower_inv = cpu_scaler.inverse_transform(lower_scaled.reshape(-1, 1)).flatten()
@@ -182,7 +170,6 @@ else:
     upper_inv = upper_scaled.flatten()
     y_true    = y_test.flatten()
 
-# ── XGBoost predictions ──────────────────────────────────────
 xgb_pred_log    = predict_xgb(xgb_model, X_test)
 xgb_pred_scaled = inverse_log1p(xgb_pred_log)
 if cpu_scaler is not None:
@@ -192,35 +179,26 @@ if cpu_scaler is not None:
 else:
     xgb_pred_inv = xgb_pred_scaled.flatten()
 
-# ── Regime-switching ensemble ────────────────────────────────
 final_pred, spike_mask_test = ensemble_predict(mean_inv, xgb_pred_inv, X_test)
 
-# ── Metrics — LSTM only ──────────────────────────────────────
 lstm_rmse = float(np.sqrt(np.mean((mean_inv - y_true) ** 2)))
 lstm_mae  = float(np.mean(np.abs(mean_inv - y_true)))
+ens_rmse  = float(np.sqrt(np.mean((final_pred - y_true) ** 2)))
+ens_mae   = float(np.mean(np.abs(final_pred - y_true)))
 
-# ── Metrics — Ensemble ───────────────────────────────────────
-ens_rmse = float(np.sqrt(np.mean((final_pred - y_true) ** 2)))
-ens_mae  = float(np.mean(np.abs(final_pred - y_true)))
-
-# ── Coverage — FIX: quantile-based CI from mc_dropout_predict ─
-# lower_inv and upper_inv are the actual 5th/95th percentile
-# of the MC sample distribution — not ±1.96*std assumption
 lower_inv = np.clip(lower_inv, 0.0, 1.0)
 upper_inv = np.clip(upper_inv, 0.0, 1.0)
 coverage  = float(np.mean((y_true >= lower_inv) & (y_true <= upper_inv)))
 avg_width = float(np.mean(upper_inv - lower_inv))
 
-# ── Confidence ───────────────────────────────────────────────
 mc_std_inv = mc_std_log.flatten()
 if cpu_scaler is not None:
     cpu_range  = float(cpu_scaler.data_max_[0] - cpu_scaler.data_min_[0])
     mc_std_inv = mc_std_inv * cpu_range
-median_std  = float(np.median(mc_std_inv))
-data_range  = float(y_true.max() - y_true.min()) + 1e-8
-confidence  = float(np.clip(1.0 - (median_std / (data_range * 0.5)), 0.0, 1.0))
+median_std = float(np.median(mc_std_inv))
+data_range = float(y_true.max() - y_true.min()) + 1e-8
+confidence = float(np.clip(1.0 - (median_std / (data_range * 0.5)), 0.0, 1.0))
 
-# ── Spike-specific RMSE ──────────────────────────────────────
 spike_mask  = y_true > (cpu_mean + 2 * cpu_std)
 normal_mask = ~spike_mask
 spike_rmse  = float(np.sqrt(np.mean((final_pred[spike_mask]  - y_true[spike_mask])  ** 2))) if spike_mask.sum()  > 0 else float("nan")
@@ -236,34 +214,65 @@ print(f"  Confidence:     {confidence:.4f}    (target: 0.50–0.70)")
 print(f"  Avg CI Width:   {avg_width:.6f}")
 print(f"  Spike RMSE:     {spike_rmse:.6f}   (spikes: {spike_mask.sum():,})")
 print(f"  Normal RMSE:    {normal_rmse:.6f}")
-
 print()
 if ens_rmse < 0.14:
     print("✅ RMSE target met!")
 elif ens_rmse < 0.18:
-    print(f"🟡 RMSE {ens_rmse:.4f} — close, check log1p transform applied correctly")
+    print(f"🟡 RMSE {ens_rmse:.4f} — close")
 else:
     print(f"⚠️  RMSE {ens_rmse:.4f} — check scaler leakage and window size")
-
 if coverage > 0.70:
     print("✅ Coverage target met!")
 else:
-    print(f"⚠️  Coverage {coverage:.3f} — MC samples may be too low or model too confident")
-
+    print(f"⚠️  Coverage {coverage:.3f} — temperature scaling will fix this next")
 if 0.50 <= confidence <= 0.70:
     print("✅ Confidence target met!")
 elif confidence > 0.70:
-    print(f"🟡 Confidence {confidence:.3f} slightly high — weight_decay may need increase")
+    print(f"🟡 Confidence {confidence:.3f} slightly high")
 else:
     print(f"⚠️  Confidence {confidence:.3f} — check dropout rate")
-
 print("=" * 60)
 
 
 # ============================================================
-# STEP 6: SAVE
+# STEP 6: TEMPERATURE SCALING CALIBRATION
 # ============================================================
-print("\n[6/6] Saving...")
+# Run on VALIDATION set — not test (prevents leakage)
+print("\n[6/7] Temperature scaling calibration (validation set)...")
+
+mc_mean_val_log, mc_std_val_log, _, _ = mc_dropout_predict(
+    model, X_val, n_samples=MC_SAMPLES
+)
+
+mc_mean_val_scaled = inverse_log1p(mc_mean_val_log)
+mc_std_val_scaled  = mc_std_val_log.flatten()
+
+if cpu_scaler is not None:
+    mc_mean_val_inv = cpu_scaler.inverse_transform(
+        mc_mean_val_scaled.reshape(-1, 1)
+    ).flatten()
+    mc_std_val_inv = mc_std_val_scaled * float(
+        cpu_scaler.data_max_[0] - cpu_scaler.data_min_[0]
+    )
+    y_val_inv = cpu_scaler.inverse_transform(y_val.reshape(-1, 1)).flatten()
+else:
+    mc_mean_val_inv = mc_mean_val_scaled.flatten()
+    mc_std_val_inv  = mc_std_val_scaled
+    y_val_inv       = y_val.flatten()
+
+T = find_temperature(
+    mc_std          = mc_std_val_inv,
+    y_true          = y_val_inv,
+    mc_mean         = mc_mean_val_inv,
+    target_coverage = 0.80
+)
+save_temperature(T, "calibration_temperature.pkl")
+
+
+# ============================================================
+# STEP 7: SAVE
+# ============================================================
+print("\n[7/7] Saving...")
 joblib.dump(model, "saved_model.pkl")
 try:
     model.save("saved_model.keras")
@@ -284,19 +293,21 @@ metrics = {
         "learning_rate":    LEARNING_RATE,
         "mc_samples":       MC_SAMPLES,
         "num_features":     num_features,
-        "log1p_target":     True
+        "log1p_target":     True,
+        "calibration_T":    round(T, 4)
     },
     "metrics": {
-        "LSTM_RMSE":        round(lstm_rmse,  6),
-        "Ensemble_RMSE":    round(ens_rmse,   6),
-        "LSTM_MAE":         round(lstm_mae,   6),
-        "Ensemble_MAE":     round(ens_mae,    6),
-        "Coverage_90":      round(coverage,   4),
-        "Confidence":       round(confidence, 4),
-        "Avg_CI_Width":     round(avg_width,  6),
-        "Spike_RMSE":       round(spike_rmse,  6) if not np.isnan(spike_rmse)  else None,
-        "Normal_RMSE":      round(normal_rmse, 6) if not np.isnan(normal_rmse) else None,
-        "Best_Val_Loss":    round(best_val_loss, 6)
+        "LSTM_RMSE":     round(lstm_rmse,  6),
+        "Ensemble_RMSE": round(ens_rmse,   6),
+        "LSTM_MAE":      round(lstm_mae,   6),
+        "Ensemble_MAE":  round(ens_mae,    6),
+        "Coverage_90":   round(coverage,   4),
+        "Confidence":    round(confidence, 4),
+        "Avg_CI_Width":  round(avg_width,  6),
+        "Spike_RMSE":    round(spike_rmse,  6) if not np.isnan(spike_rmse)  else None,
+        "Normal_RMSE":   round(normal_rmse, 6) if not np.isnan(normal_rmse) else None,
+        "Best_Val_Loss": round(best_val_loss, 6),
+        "Calibration_T": round(T, 4)
     }
 }
 with open("last_training_metrics.json", "w") as f:

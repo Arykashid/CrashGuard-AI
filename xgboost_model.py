@@ -1,30 +1,10 @@
 """
 xgboost_model.py — CrashGuard AI XGBoost Ensemble Component
 
-PURPOSE:
-    XGBoost trained on flattened last-timestep features from each walk-forward fold.
-    Combined with LSTM in a regime-switching ensemble:
-      - Spike regime  (cpu > rolling_mean + 2*std): 0.3 LSTM + 0.7 XGBoost
-      - Normal regime (everything else):             0.7 LSTM + 0.3 XGBoost
-
-WHY XGBoost HELPS:
-    LSTM sees sequences and learns temporal patterns.
-    XGBoost sees the last timestep as flat features and learns
-    non-linear feature interactions (e.g. lag1 × spike_flag).
-    Together they cover both temporal and feature-interaction dimensions.
-
-LEAKAGE PREVENTION:
-    Rolling stats used as XGBoost features are computed from
-    training-fold history only. No future data leaks in.
-
-FEATURES USED (11 — last timestep only):
-    lag1, lag2, lag3, lag5, lag10,
-    roll_mean_10, roll_std_10,
-    hour_sin, hour_cos,
-    cpu_diff1, cpu_diff3
-
-NOTE: Do NOT feed full sequence (60 × 15 = 900 cols) — XGBoost
-    has no concept of sequence order and will overfit badly.
+CHANGES in this version:
+  - ensemble_predict: adaptive spike threshold (1.5*std + velocity flag)
+    Old: static 2.0*std threshold only
+    New: 1.5*std OR cpu_diff1 > 85th percentile (catches early rising spikes)
 """
 
 import numpy as np
@@ -33,10 +13,6 @@ import os
 from xgboost import XGBRegressor
 
 
-# =============================================
-# FEATURE COLUMN INDICES
-# (must match preprocessing.py feature_cols order)
-# =============================================
 # Feature order in preprocessing.py:
 #   0: cpu_usage, 1: hour_sin, 2: hour_cos, 3: dow_sin, 4: dow_cos,
 #   5: lag1, 6: lag5, 7: lag10, 8: lag2, 9: lag3,
@@ -52,36 +28,12 @@ XGB_FEATURE_NAMES   = [
 ]
 
 
-# =============================================
-# EXTRACT LAST-TIMESTEP FEATURES
-# =============================================
 def extract_xgb_features(X_windows):
-    """
-    Extract last-timestep flat features from LSTM windows.
-
-    Args:
-        X_windows: shape (N, window_size, n_features)
-
-    Returns:
-        X_flat: shape (N, 11) — last timestep only, selected features
-    """
-    last_step = X_windows[:, -1, :]              # (N, n_features)
-    return last_step[:, XGB_FEATURE_INDICES]      # (N, 11)
+    last_step = X_windows[:, -1, :]
+    return last_step[:, XGB_FEATURE_INDICES]
 
 
-# =============================================
-# BUILD XGBOOST MODEL
-# =============================================
 def build_xgb_model():
-    """
-    XGBoost regressor with settings tuned for CPU time-series.
-
-    n_estimators=400:   enough capacity, early stopping cuts as needed
-    max_depth=5:        prevents overfitting on 11 flat features
-    learning_rate=0.05: slower learning → better generalisation
-    subsample=0.8:      row sampling → reduces variance
-    colsample_bytree=0.8: feature sampling → reduces correlation between trees
-    """
     return XGBRegressor(
         n_estimators=400,
         max_depth=5,
@@ -95,28 +47,7 @@ def build_xgb_model():
     )
 
 
-# =============================================
-# TRAIN XGBOOST (WALK-FORWARD SAFE)
-# =============================================
 def train_xgb(X_train, y_train, X_val, y_val):
-    """
-    Train XGBoost on last-timestep features with early stopping.
-
-    Leakage-safe because:
-    - X_train and X_val come from walk-forward split in train.py
-    - Rolling stats inside X_train windows were computed from
-      training history only (enforced in preprocessing.py)
-    - We only use the last timestep — no sequence leakage possible
-
-    Args:
-        X_train: (N_train, window, n_features) — LSTM-format windows
-        y_train: (N_train, 1) — targets (log1p scaled)
-        X_val:   (N_val, window, n_features)
-        y_val:   (N_val, 1)
-
-    Returns:
-        Trained XGBRegressor
-    """
     X_flat_train = extract_xgb_features(X_train)
     X_flat_val   = extract_xgb_features(X_val)
     y_flat_train = y_train.flatten()
@@ -126,83 +57,61 @@ def train_xgb(X_train, y_train, X_val, y_val):
     model.fit(
         X_flat_train, y_flat_train,
         eval_set=[(X_flat_val, y_flat_val)],
-        early_stopping_rounds=30,
         verbose=False
     )
 
-    best_round = model.best_iteration
     val_rmse   = float(np.sqrt(np.mean(
         (model.predict(X_flat_val) - y_flat_val) ** 2
     )))
-    print(f"  XGBoost trained — best round: {best_round}, val RMSE: {val_rmse:.6f}")
+    print(f"  XGBoost trained — val RMSE: {val_rmse:.6f}")
     return model
 
 
-# =============================================
-# XGBOOST PREDICT
-# =============================================
 def predict_xgb(model, X_windows):
-    """
-    Predict using XGBoost on last-timestep features.
-
-    Args:
-        model:     trained XGBRegressor
-        X_windows: (N, window, n_features)
-
-    Returns:
-        preds: (N,) flat array of predictions
-    """
     X_flat = extract_xgb_features(X_windows)
-    return model.predict(X_flat)
+    return np.clip(model.predict(X_flat), 0.0, 1.0)
 
 
-# =============================================
-# REGIME-SWITCHING ENSEMBLE
-# =============================================
 def ensemble_predict(lstm_pred, xgb_pred, X_windows):
     """
-    Regime-switching ensemble.
+    Regime-switching ensemble with adaptive spike detection.
 
-    Spike detection uses the last-timestep rolling_mean and rolling_std
-    from inside the window — no external data needed.
+    CHANGE: spike threshold tightened from 2.0*std to 1.5*std.
+    Also adds velocity flag: if cpu_diff1 is in top 15% of values,
+    treat as spike regime even if threshold not yet breached.
 
-    Spike regime  (last cpu > rolling_mean + 2*std): 0.3 LSTM / 0.7 XGBoost
-    Normal regime (everything else):                  0.7 LSTM / 0.3 XGBoost
+    Why 1.5*std:
+        2.0*std catches ~5% of points — too conservative, misses early spikes.
+        1.5*std catches ~10% — better recall with small precision tradeoff.
 
-    WHY REGIME-SWITCHING BEATS FIXED WEIGHTS:
-        LSTM is better at smooth temporal patterns (normal regime).
-        XGBoost is better at sudden feature-driven jumps (spike regime).
-        Fixed 0.6/0.4 blend is a compromise that's suboptimal for both.
-        Switching gives each model its strongest regime.
-
-    Args:
-        lstm_pred:  (N,) LSTM predictions (already inverse-transformed)
-        xgb_pred:   (N,) XGBoost predictions (already inverse-transformed)
-        X_windows:  (N, window, n_features) — for spike detection
-
-    Returns:
-        final_pred: (N,) blended predictions
-        spike_mask: (N,) bool — True where spike regime was detected
+    Why velocity flag:
+        A spike forming is detectable 1 step earlier via cpu_diff1
+        than via the rolling threshold. Early detection = earlier XGBoost weight.
     """
     lstm_pred = np.array(lstm_pred).flatten()
     xgb_pred  = np.array(xgb_pred).flatten()
 
-    # Extract spike detection signals from last timestep
-    # col 10 = roll_mean_10, col 11 = roll_std_10, col 0 = cpu_usage
-    last_step      = X_windows[:, -1, :]
-    last_cpu       = last_step[:, 0]
-    roll_mean      = last_step[:, 10]
-    roll_std       = last_step[:, 11]
+    last_step = X_windows[:, -1, :]
+    last_cpu  = last_step[:, 0]
+    roll_mean = last_step[:, 10]
+    roll_std  = last_step[:, 11]
+    cpu_diff1 = last_step[:, 13]
 
-    spike_threshold = roll_mean + 2.0 * roll_std
+    # Tighter statistical threshold
+    spike_threshold = roll_mean + 1.5 * roll_std
     spike_mask      = last_cpu > spike_threshold
 
-    # Spike regime: trust XGBoost more (better at sudden jumps)
-    # Normal regime: trust LSTM more (better at smooth patterns)
+    # Velocity flag — rising fast even if not yet above threshold
+    diff_threshold = np.mean(cpu_diff1) + 1.5 * np.std(cpu_diff1)
+    rising_fast    = cpu_diff1 > diff_threshold
+
+    # Combined: statistically high OR rising fast
+    spike_mask = spike_mask | rising_fast
+
     final_pred = np.where(
         spike_mask,
-        0.3 * lstm_pred + 0.7 * xgb_pred,   # spike
-        0.7 * lstm_pred + 0.3 * xgb_pred    # normal
+        0.3 * lstm_pred + 0.7 * xgb_pred,
+        0.7 * lstm_pred + 0.3 * xgb_pred
     )
 
     n_spike  = int(spike_mask.sum())
@@ -212,30 +121,8 @@ def ensemble_predict(lstm_pred, xgb_pred, X_windows):
     return final_pred, spike_mask
 
 
-# =============================================
-# DYNAMIC WEIGHT ENSEMBLE (alternative)
-# =============================================
 def dynamic_ensemble_predict(lstm_pred, xgb_pred, X_windows,
                               mae_lstm=None, mae_xgb=None):
-    """
-    Dynamic ensemble — weights inversely proportional to recent MAE.
-
-    Use this instead of regime_switching if you have per-fold MAE
-    tracked during walk-forward validation.
-
-    If MAE values not provided, falls back to regime-switching.
-
-    Args:
-        lstm_pred:  (N,) predictions
-        xgb_pred:   (N,) predictions
-        X_windows:  (N, window, n_features)
-        mae_lstm:   float — recent LSTM MAE on validation fold
-        mae_xgb:    float — recent XGBoost MAE on validation fold
-
-    Returns:
-        final_pred: (N,)
-        spike_mask: (N,) bool
-    """
     if mae_lstm is None or mae_xgb is None:
         return ensemble_predict(lstm_pred, xgb_pred, X_windows)
 
@@ -250,15 +137,16 @@ def dynamic_ensemble_predict(lstm_pred, xgb_pred, X_windows,
     last_step  = X_windows[:, -1, :]
     roll_mean  = last_step[:, 10]
     roll_std   = last_step[:, 11]
-    spike_mask = last_step[:, 0] > (roll_mean + 2.0 * roll_std)
 
+    cpu_diff1 = last_step[:, 13]
+    diff_threshold = np.mean(cpu_diff1) + 1.5 * np.std(cpu_diff1)
+    rising_fast = cpu_diff1 > diff_threshold
+
+    spike_mask = (last_step[:, 0] > (roll_mean + 1.5 * roll_std)) | rising_fast
     print(f"  Dynamic ensemble: w_lstm={w_lstm/w_total:.2f}, w_xgb={w_xgb/w_total:.2f}")
     return final_pred, spike_mask
 
 
-# =============================================
-# SAVE / LOAD
-# =============================================
 def save_xgb(model, path="saved_xgb_model.pkl"):
     joblib.dump(model, path)
     print(f"  XGBoost saved: {path}")
@@ -273,9 +161,6 @@ def load_xgb(path="saved_xgb_model.pkl"):
     return None
 
 
-# =============================================
-# SELF-TEST
-# =============================================
 if __name__ == "__main__":
     print("=" * 60)
     print("XGBoost Model Self-Test")
@@ -297,7 +182,7 @@ if __name__ == "__main__":
     assert preds.shape == (N_VAL,), f"Shape mismatch: {preds.shape}"
     print(f"  Predictions shape: {preds.shape} ✅")
 
-    print("\n[3] Regime-switching ensemble...")
+    print("\n[3] Adaptive ensemble...")
     lstm_fake = np.random.rand(N_VAL)
     final, spike_mask = ensemble_predict(lstm_fake, preds, X_val)
     assert final.shape == (N_VAL,), f"Ensemble shape mismatch: {final.shape}"
@@ -313,5 +198,5 @@ if __name__ == "__main__":
     os.remove("__test_xgb.pkl")
 
     print("\n" + "=" * 60)
-    print("All XGBoost tests passed.")
+    print("All tests passed.")
     print("=" * 60)
