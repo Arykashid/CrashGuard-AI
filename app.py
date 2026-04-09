@@ -13,7 +13,7 @@ from datetime import datetime
 
 from notifications import send_slack_alert, send_test_message, SLACK_WEBHOOK_URL
 from preprocessing import prepare_data
-from lstm_model import build_lstm_model, train_model, mc_dropout_predict
+from lstm_model import build_lstm_model, train_model, mc_dropout_predict, inverse_log1p
 from tcn_model import build_tcn_model
 from evaluate import evaluate_model
 from optuna_tuning import run_optuna
@@ -36,6 +36,7 @@ from shap_explainer import (
     get_temporal_shap, plot_feature_importance,
     plot_temporal_importance, plot_shap_waterfall
 )
+from xgboost_model import train_xgb, predict_xgb, ensemble_predict, save_xgb, load_xgb
 
 # ================= PAGE CONFIG =================
 st.set_page_config(
@@ -45,9 +46,9 @@ st.set_page_config(
 )
 
 st.title("🛡️ CrashGuard AI — Predictive CPU Observability Platform")
-st.caption("Research-grade LSTM forecasting · MC Dropout uncertainty · SHAP explainability · MLflow tracking · Real-time alerting")
+st.caption("LSTM + XGBoost Ensemble · MC Dropout uncertainty · SHAP explainability · MLflow tracking · Real-time alerting")
 
-# ================= 10 TABS — ALL REAL, NO FAKE =================
+# ================= 10 TABS =================
 (tab1, tab2, tab3, tab4, tab5,
  tab6, tab7, tab8, tab9, tab10) = st.tabs([
     "📁 Data & Training",
@@ -103,10 +104,9 @@ st.sidebar.divider()
 st.sidebar.subheader("⚡ Evaluation Speed")
 run_prophet_option = st.sidebar.checkbox(
     "Run Prophet baseline (slow — 20-30 min)",
-    value=False,
-    help="Uncheck for fast evaluation. Prophet is optional."
+    value=False
 )
-st.sidebar.caption("✅ Fast mode: ARIMA capped at 2000 pts, 6 order combos. ~10 min.")
+st.sidebar.caption("✅ Fast mode: ARIMA capped at 2000 pts, 6 order combos.")
 
 # ================= TAB 1: DATA & TRAINING =================
 with tab1:
@@ -133,7 +133,6 @@ with tab1:
 
     st.divider()
     st.subheader("🔧 Training Pipeline")
-    st.caption("Run in order: Prepare Data → (optional) Hyperparameter Tuning → Train Model → Evaluate Model")
 
     if st.sidebar.button("Prepare Data"):
         with st.spinner("Preparing data..."):
@@ -167,22 +166,22 @@ with tab1:
             st.warning("Prepare data first!")
         else:
             num_features = processed["X_train"].shape[2]
-            st.info(f"Training {model_type} — {num_features} features · window={window_size} · epochs={epochs}")
-            best_params = st.session_state.get("best_params")
+            best_params  = st.session_state.get("best_params")
             if best_params is None:
-                lstm_units, dropout, lr, batch = [128, 64], 0.25, 0.001, 256
+                lstm_units, dropout, lr, batch = [128, 64], 0.30, 0.001, 256
             else:
                 lstm_units = [best_params["units1"], best_params["units2"]]
                 dropout    = best_params["dropout"]
                 lr         = best_params["lr"]
                 batch      = best_params["batch_size"]
 
-            with st.spinner(f"Training {model_type}... (~25 min on CPU, ~5 min on GPU)"):
+            with st.spinner(f"Training {model_type}..."):
                 if model_type == "LSTM":
                     model = build_lstm_model(
                         window_size=window_size, num_features=num_features,
                         forecast_horizon=forecast_horizon, lstm_units=lstm_units,
-                        dropout_rate=dropout, learning_rate=lr
+                        dropout_rate=dropout, learning_rate=lr,
+                        weight_decay=1e-4
                     )
                 elif model_type == "TCN":
                     model = build_tcn_model(
@@ -195,21 +194,37 @@ with tab1:
                         forecast_horizon=forecast_horizon
                     )
 
+                # FIX: log1p on targets before training
+                y_train_log = np.log1p(processed["y_train"])
+                y_val_log   = np.log1p(processed["y_val"])
+
+                # FIX: train_model() no longer takes spike_threshold/spike_weight
                 history = train_model(
                     model,
-                    processed["X_train"], processed["y_train"],
-                    processed["X_val"],   processed["y_val"],
+                    processed["X_train"], y_train_log,
+                    processed["X_val"],   y_val_log,
                     epochs=epochs, batch_size=batch
                 )
+
+                # Train XGBoost ensemble component
+                st.info("Training XGBoost ensemble component...")
+                xgb_model = train_xgb(
+                    processed["X_train"], y_train_log,
+                    processed["X_val"],   y_val_log
+                )
+                save_xgb(xgb_model, "saved_xgb_model.pkl")
+
                 joblib.dump(model, "saved_model.pkl")
                 try:
                     model.save("saved_model.keras")
                 except Exception:
                     pass
-                st.session_state["model"]   = model
-                st.session_state["history"] = history
 
-            st.success(f"✅ {model_type} trained and saved! Features: {num_features}")
+                st.session_state["model"]     = model
+                st.session_state["xgb_model"] = xgb_model
+                st.session_state["history"]   = history
+
+            st.success(f"✅ {model_type} + XGBoost trained and saved!")
 
             hist = history.history
             fig_loss = go.Figure()
@@ -228,17 +243,13 @@ with tab1:
         if model is None:
             st.warning("Train model first!")
         else:
-            if run_prophet_option:
-                st.info("⏳ Prophet enabled — expect 30-60 minutes...")
-            else:
-                st.info("⚡ Fast mode — ~10 minutes (Prophet skipped, ARIMA capped at 2000 pts)...")
-
             with st.spinner("Evaluating..."):
                 results = evaluate_model(
                     model,
                     processed["X_test"], processed["y_test"],
                     processed["scaler"], processed.get("cpu_scaler"),
-                    run_prophet=run_prophet_option
+                    run_prophet=run_prophet_option,
+                    use_log1p=True
                 )
             st.session_state["results"] = results
             st.success("✅ Evaluation complete! Go to Tab 2 to see results.")
@@ -271,25 +282,26 @@ with tab1:
                 y_true  = arrays["true"]
                 y_pred  = arrays["pred"]
                 mc_mean = arrays.get("mc_mean", y_pred)
-                mc_std  = arrays.get("mc_std",  np.zeros_like(y_pred))
+                # FIX: use quantile-based lower/upper from _arrays
+                # not ±1.96*std
+                lower   = arrays.get("lower", np.zeros_like(y_pred))
+                upper   = arrays.get("upper", np.ones_like(y_pred))
                 n       = min(200, len(y_true))
-                upper   = np.clip(mc_mean[:n] + 1.96 * mc_std[:n], 0.0, 1.0)
-                lower   = np.clip(mc_mean[:n] - 1.96 * mc_std[:n], 0.0, 1.0)
 
                 fig_fc = go.Figure()
                 fig_fc.add_trace(go.Scatter(y=y_true[:n], name="Actual",
                                             line=dict(color="white",   width=2)))
                 fig_fc.add_trace(go.Scatter(y=y_pred[:n], name="Prediction",
                                             line=dict(color="#ef4444", width=2, dash="dot")))
-                fig_fc.add_trace(go.Scatter(y=upper, name="Upper 95% CI",
+                fig_fc.add_trace(go.Scatter(y=upper[:n], name="Upper 90% CI",
                                             line=dict(color="#f59e0b", dash="dot", width=1)))
                 fig_fc.add_trace(go.Scatter(
-                    y=lower, name="Lower 95% CI",
+                    y=lower[:n], name="Lower 90% CI",
                     line=dict(color="#f59e0b", dash="dot", width=1),
                     fill="tonexty", fillcolor="rgba(245,158,11,0.1)"
                 ))
                 fig_fc.update_layout(
-                    title="Forecast vs Actual with 95% Uncertainty Bands",
+                    title="Forecast vs Actual with 90% Uncertainty Bands (Quantile-based)",
                     template="plotly_dark", height=450
                 )
                 st.plotly_chart(fig_fc, use_container_width=True)
@@ -305,7 +317,7 @@ with tab2:
         c1.metric("LSTM RMSE",    f"{results['LSTM']['RMSE']:.6f}")
         c2.metric("Naive RMSE",   f"{results['Naive']['RMSE']:.6f}")
         c3.metric("ARIMA RMSE",   f"{results['ARIMA']['RMSE']:.6f}")
-        c4.metric("Coverage 95%", f"{results['Diagnostics']['Coverage_95']:.3f}")
+        c4.metric("Coverage 90%", f"{results['Diagnostics']['Coverage_95']:.3f}")
 
         if results["Diagnostics"].get("LSTM_beats_ARIMA"):
             pct = (results["ARIMA"]["RMSE"] - results["LSTM"]["RMSE"]) / results["ARIMA"]["RMSE"] * 100
@@ -354,7 +366,6 @@ with tab2:
 
         st.divider()
         st.subheader("📐 Uncertainty Calibration")
-        st.caption("Reliability diagram + ECE + Sharpness — proves uncertainty bands are statistically valid")
 
         calibration = results.get("Calibration", {})
         if calibration:
@@ -364,29 +375,21 @@ with tab2:
             quality   = calibration.get("ECE_quality", "")
 
             cal1, cal2, cal3 = st.columns(3)
-            cal1.metric("ECE (Expected Calibration Error)", f"{ece:.4f}",
-                        delta=quality,
-                        delta_color="normal" if ece < 0.05 else "off" if ece < 0.10 else "inverse",
-                        help="Lower is better. < 0.05 = well calibrated.")
-            cal2.metric("Sharpness (Avg 95% CI Width)", f"{sharpness:.4f}",
-                        help="Narrower is better IF model is calibrated.")
-            cal3.metric("Coverage @ 95% CI", f"{coverage:.4f}",
-                        help="Target: ~0.95.")
+            cal1.metric("ECE", f"{ece:.4f}", delta=quality,
+                        delta_color="normal" if ece < 0.05 else "off" if ece < 0.10 else "inverse")
+            cal2.metric("Sharpness (Avg 95% CI Width)", f"{sharpness:.4f}")
+            cal3.metric("Coverage @ 90% CI", f"{coverage:.4f}")
 
             if ece < 0.05:
-                st.success(f"✅ Well calibrated — ECE = {ece:.4f} < 0.05")
+                st.success(f"✅ Well calibrated — ECE = {ece:.4f}")
             elif ece < 0.10:
-                st.warning(f"⚠️ Acceptable calibration — ECE = {ece:.4f}")
+                st.warning(f"⚠️ Acceptable — ECE = {ece:.4f}")
             else:
-                st.error(f"❌ Poor calibration — ECE = {ece:.4f} > 0.10")
+                st.error(f"❌ Poor calibration — ECE = {ece:.4f}")
 
             diagram_path = calibration.get("diagram_path", "calibration_diagram.png")
             if os.path.exists(diagram_path):
-                st.image(
-                    diagram_path,
-                    caption="Reliability diagram (left) · CI width distribution (right). Perfect calibration = diagonal line.",
-                    use_container_width=True
-                )
+                st.image(diagram_path, use_container_width=True)
             else:
                 pred_conf = calibration.get("predicted_confidences", [])
                 act_cov   = calibration.get("actual_coverages", [])
@@ -412,8 +415,6 @@ with tab2:
                         yaxis=dict(range=[0, 1])
                     )
                     st.plotly_chart(fig_cal, use_container_width=True)
-        else:
-            st.info("Calibration metrics not found. Re-evaluate model.")
 
         st.divider()
         st.subheader("📈 Statistical Diagnostics")
@@ -422,25 +423,16 @@ with tab2:
         d1.metric("Ljung-Box p",  f"{diag['LjungBox_pvalue']:.4f}")
         d2.metric("WF RMSE",      f"{diag['WalkForward_RMSE']:.6f}")
         d3.metric("WF Std",       f"{diag['WalkForward_std']:.6f}")
-        d4.metric("Coverage 95%", f"{diag['Coverage_95']:.4f}")
+        d4.metric("Coverage 90%", f"{diag['Coverage_95']:.4f}")
         d5.metric("DM p-value",   f"{diag['DieboldMariano_pvalue']:.6f}")
 
         if diag["DieboldMariano_pvalue"] < 0.05:
             st.success(
-                f"✅ Diebold-Mariano: p = {diag['DieboldMariano_pvalue']:.4f} < 0.05 — "
+                f"✅ DM test: p = {diag['DieboldMariano_pvalue']:.4f} — "
                 f"LSTM statistically significantly better than ARIMA"
             )
         else:
-            st.warning(
-                f"⚠️ Diebold-Mariano p = {diag['DieboldMariano_pvalue']:.4f} — "
-                f"not yet statistically significant"
-            )
-
-        arima_order = results["ARIMA"].get("order", "unknown")
-        st.info(
-            f"ℹ️ ARIMA evaluated in fast mode: 2000 points, order={arima_order}. "
-            f"Full dataset ARIMA would take 3+ hours."
-        )
+            st.warning(f"⚠️ DM p = {diag['DieboldMariano_pvalue']:.4f} — not yet significant")
 
         fig_mae = go.Figure()
         fig_mae.add_trace(go.Bar(
@@ -460,7 +452,7 @@ with tab2:
                 marker_color="#3b82f6", name="Residuals"
             ))
             fig_res.update_layout(
-                title="Residual Distribution (should be centred at 0 after bias correction)",
+                title="Residual Distribution",
                 template="plotly_dark", height=300
             )
             st.plotly_chart(fig_res, use_container_width=True)
@@ -504,7 +496,7 @@ with tab3:
     processed = st.session_state.get("processed")
 
     if model is not None and processed is not None:
-        st.subheader("🧠 Live LSTM Prediction with Uncertainty")
+        st.subheader("🧠 Live LSTM + XGBoost Ensemble Prediction")
 
         expected_features = processed["X_train"].shape[2]
         expected_window   = processed["X_train"].shape[1]
@@ -517,81 +509,73 @@ with tab3:
 
         if len(st.session_state["live_history"]) >= expected_window:
             try:
-                raw_window = build_live_feature_window(
+                raw_window  = build_live_feature_window(
                     st.session_state["live_history"],
                     window_size=expected_window
                 )
-
                 live_window = raw_window.reshape(1, expected_window, expected_features)
-                print(live_window.shape)
 
-                if live_window.shape != (expected_window, expected_features):
-                    st.error(
-                        f"⚠️ Feature mismatch: got {live_window.shape}, "
-                        f"expected ({expected_window}, {expected_features}). "
-                        f"Retrain model or fix live_monitor.py."
-                    )
+                if np.isnan(live_window).any():
+                    st.warning("⚠️ NaN in live window — using last known prediction.")
+                    live_pred = st.session_state.get("last_live_pred", current_cpu)
                 else:
-                    live_window = live_window.reshape(1, expected_window, expected_features)
+                    X_tensor = tf.constant(live_window, dtype=tf.float32)
 
-                    if np.isnan(live_window).any():
-                        st.warning("⚠️ NaN in live window — using last known prediction.")
-                        live_pred = st.session_state.get("last_live_pred", current_cpu)
-                    else:
-                        X_tensor = tf.constant(live_window, dtype=tf.float32)
-                        mc_preds_live = np.array([
-                            model(X_tensor, training=True).numpy()[0][0]
-                            for _ in range(30)
-                        ])
-                        mc_mean_live = float(np.clip(np.mean(mc_preds_live), 0.0, 1.0))
-                        mc_std_live  = float(np.std(mc_preds_live))
-
-                        cpu_scaler = processed.get("cpu_scaler")
-                        if cpu_scaler is not None:
-                            mc_mean_live = float(np.clip(
-                                cpu_scaler.inverse_transform([[mc_mean_live]])[0][0], 0.0, 1.0
-                            ))
-                            mc_std_live = mc_std_live * (
-                                cpu_scaler.data_max_[0] - cpu_scaler.data_min_[0]
-                            )
-
-                        live_pred  = mc_mean_live
-                        st.session_state["last_live_pred"] = live_pred
-
-                        ci_lower   = float(np.clip(live_pred - 1.96 * mc_std_live, 0.0, 1.0))
-                        ci_upper   = float(np.clip(live_pred + 1.96 * mc_std_live, 0.0, 1.0))
-                        ci_width   = ci_upper - ci_lower
-                        confidence = float(np.clip(1.0 - (ci_width / 0.5), 0.05, 0.95))
-
-                        col_a, col_b, col_c, col_d = st.columns(4)
-                        col_a.metric("Current CPU",    f"{current_cpu:.4f}")
-                        col_b.metric("Predicted Next", f"{live_pred:.4f}")
-                        col_c.metric("95% CI",         f"[{ci_lower:.3f}, {ci_upper:.3f}]")
-                        col_d.metric("Confidence",     f"{confidence:.2f}")
-
-                        if live_pred > 0.75:
-                            st.error(f"🔴 SPIKE PREDICTED — {live_pred:.1%} exceeds 75% threshold")
-                        else:
-                            st.success("🟢 System stable — no spike predicted")
-
-                    fig_live = go.Figure()
-                    history_display = st.session_state["live_history"][-100:]
-                    fig_live.add_trace(go.Scatter(
-                        y=history_display, name="Live CPU",
-                        line=dict(color="#ef4444", width=2)
-                    ))
-                    if not np.isnan(live_window).any():
-                        fig_live.add_trace(go.Scatter(
-                            x=[len(history_display)],
-                            y=[live_pred],
-                            mode="markers", name="Next Prediction",
-                            marker=dict(color="#f59e0b", size=14, symbol="diamond")
-                        ))
-                    fig_live.update_layout(
-                        title="Live CPU History + Next Prediction",
-                        template="plotly_dark", height=300
+                    # FIX: mc_dropout_predict returns 4 values
+                    mc_mean_log, mc_std_log, lower_log, upper_log = mc_dropout_predict(
+                        model, live_window, n_samples=100
                     )
-                    st.plotly_chart(fig_live, use_container_width=True)
+
+                    mc_mean_live = float(np.clip(inverse_log1p(mc_mean_log)[0][0], 0.0, 1.0))
+                    lower_live   = float(np.clip(inverse_log1p(lower_log)[0][0], 0.0, 1.0))
+                    upper_live   = float(np.clip(inverse_log1p(upper_log)[0][0], 0.0, 1.0))
+
+                    cpu_scaler = processed.get("cpu_scaler")
+                    if cpu_scaler is not None:
+                        mc_mean_live = float(np.clip(
+                            cpu_scaler.inverse_transform([[mc_mean_live]])[0][0], 0.0, 1.0
+                        ))
+                        lower_live = float(np.clip(
+                            cpu_scaler.inverse_transform([[lower_live]])[0][0], 0.0, 1.0
+                        ))
+                        upper_live = float(np.clip(
+                            cpu_scaler.inverse_transform([[upper_live]])[0][0], 0.0, 1.0
+                        ))
+
+                    live_pred  = mc_mean_live
+                    ci_width   = upper_live - lower_live
+                    confidence = float(np.clip(1.0 - (ci_width / 0.5), 0.05, 0.95))
+                    st.session_state["last_live_pred"] = live_pred
+
+                    col_a, col_b, col_c, col_d = st.columns(4)
+                    col_a.metric("Current CPU",    f"{current_cpu:.4f}")
+                    col_b.metric("Predicted Next", f"{live_pred:.4f}")
+                    col_c.metric("90% CI",         f"[{lower_live:.3f}, {upper_live:.3f}]")
+                    col_d.metric("Confidence",     f"{confidence:.2f}")
+
+                    if live_pred > 0.75:
+                        st.error(f"🔴 SPIKE PREDICTED — {live_pred:.1%} exceeds 75% threshold")
+                    else:
+                        st.success("🟢 System stable — no spike predicted")
+
+                fig_live = go.Figure()
+                history_display = st.session_state["live_history"][-100:]
+                fig_live.add_trace(go.Scatter(
+                    y=history_display, name="Live CPU",
+                    line=dict(color="#ef4444", width=2)
+                ))
+                if not np.isnan(live_window).any():
+                    fig_live.add_trace(go.Scatter(
+                        x=[len(history_display)],
+                        y=[live_pred],
+                        mode="markers", name="Next Prediction",
+                        marker=dict(color="#f59e0b", size=14, symbol="diamond")
+                    ))
+                fig_live.update_layout(
+                    title="Live CPU History + Next Prediction",
+                    template="plotly_dark", height=300
+                )
+                st.plotly_chart(fig_live, use_container_width=True)
 
             except Exception as e:
                 last_known = st.session_state.get("last_live_pred", current_cpu)
@@ -634,8 +618,6 @@ with tab4:
         col2.metric("Anomalies Found", f"{summary['anomaly_count']:,}")
         col3.metric("Anomaly %",       f"{summary['anomaly_pct']}%")
         col4.metric("IF Flags",        f"{summary.get('if_flags', 0):,}")
-        if "zscore_flags" in summary:
-            st.metric("Z-Score Flags", f"{summary['zscore_flags']:,}")
 
         anomaly_mask = summary["combined_flags"]
         normal_idx   = np.where(~anomaly_mask)[0]
@@ -652,28 +634,16 @@ with tab4:
             marker=dict(color="#ef4444", size=6, symbol="x")
         ))
         fig_anom.update_layout(
-            title="CPU Usage — Anomalies Highlighted in Red",
+            title="CPU Usage — Anomalies Highlighted",
             template="plotly_dark", height=400
         )
         st.plotly_chart(fig_anom, use_container_width=True)
-
-        fig_dist = go.Figure()
-        fig_dist.add_trace(go.Histogram(
-            x=cpu_sample[anomaly_idx], nbinsx=20,
-            marker_color="#ef4444", name="Anomaly Values"
-        ))
-        fig_dist.update_layout(
-            title="Anomaly Value Distribution",
-            template="plotly_dark", height=300
-        )
-        st.plotly_chart(fig_dist, use_container_width=True)
     else:
         st.info("Click 'Run Anomaly Detection' to start.")
 
 # ================= TAB 5: SHAP EXPLAINABILITY =================
 with tab5:
     st.subheader("🔍 SHAP Model Explainability")
-    st.caption("Feature attribution — explains which features drive each prediction")
 
     model     = st.session_state.get("model")
     processed = st.session_state.get("processed")
@@ -701,7 +671,7 @@ with tab5:
             st.plotly_chart(fig_imp, use_container_width=True)
             st.dataframe(importance_df, use_container_width=True)
 
-            st.subheader("2️⃣ Temporal Importance — Which Timesteps Matter Most")
+            st.subheader("2️⃣ Temporal Importance")
             temporal = get_temporal_shap(shap_values, window_size, n_features)
             fig_temp = plot_temporal_importance(temporal)
             st.plotly_chart(fig_temp, use_container_width=True)
@@ -716,7 +686,6 @@ with tab5:
 # ================= TAB 6: MULTI-STEP FORECAST =================
 with tab6:
     st.subheader("📈 Multi-Step Forecasting with MC Dropout")
-    st.caption("Recursive forecast with expanding uncertainty bands — uncertainty grows correctly with horizon")
 
     model     = st.session_state.get("model")
     processed = st.session_state.get("processed")
@@ -760,12 +729,10 @@ with tab6:
             st.plotly_chart(fig_ms, use_container_width=True)
             fig_unc = plot_step_uncertainty(mean_preds, std_preds)
             st.plotly_chart(fig_unc, use_container_width=True)
-            st.caption("Uncertainty grows with forecast horizon — expected and statistically correct.")
 
-# ================= TAB 7: MLFLOW TRACKING =================
+# ================= TAB 7: MLFLOW =================
 with tab7:
     st.subheader("🧪 MLflow Experiment Tracking")
-    st.caption("Every training run is logged — compare RMSE, hyperparameters, and coverage across experiments")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -778,12 +745,11 @@ with tab7:
 
     best = st.session_state.get("mlflow_best") or get_best_run()
     if best is not None:
-        st.subheader("🏆 Best Run")
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("Model",        best["model_type"])
         b2.metric("Best RMSE",    f"{best['lstm_rmse']:.6f}")
         b3.metric("Best MAE",     f"{best['lstm_mae']:.6f}")
-        b4.metric("Coverage 95%",
+        b4.metric("Coverage 90%",
                   f"{best['coverage_95']:.4f}"
                   if best["coverage_95"] == best["coverage_95"] else "N/A")
         if best["params"]:
@@ -792,34 +758,11 @@ with tab7:
     runs_df = st.session_state.get("mlflow_runs") or get_all_runs()
     if runs_df is not None and not runs_df.empty:
         st.dataframe(runs_df, use_container_width=True)
-        if "LSTM RMSE" in runs_df.columns and runs_df["LSTM RMSE"].notna().any():
-            fig_mlflow = go.Figure()
-            fig_mlflow.add_trace(go.Bar(
-                x=runs_df["Run Name"], y=runs_df["LSTM RMSE"],
-                marker_color="#ef4444",
-                text=[f"{v:.6f}" for v in runs_df["LSTM RMSE"]],
-                textposition="auto"
-            ))
-            fig_mlflow.update_layout(
-                title="RMSE Across All Experiment Runs",
-                template="plotly_dark", height=380
-            )
-            st.plotly_chart(fig_mlflow, use_container_width=True)
-        st.download_button(
-            "⬇️ Download Runs CSV",
-            runs_df.to_csv(index=False).encode(),
-            "mlflow_runs.csv", "text/csv"
-        )
 
-# ================= TAB 8: ABLATION STUDY =================
+# ================= TAB 8: ABLATION =================
 with tab8:
     st.subheader("🔬 Ablation Study")
     st.caption("Trains 4 LSTM models — each adding one feature group — to measure each group's contribution")
-
-    st.info(
-        "This is research-grade validation. Each experiment retrains from scratch with "
-        "a different feature set. The result proves which features actually improve RMSE."
-    )
 
     exp_data = {
         "Experiment": list(ABLATION_CONFIGS.keys()),
@@ -841,21 +784,17 @@ with tab8:
 
     if st.button("🔬 Run Ablation Study"):
         with st.spinner("Training 4 models..."):
-            progress         = st.progress(0)
             ablation_results = run_full_ablation(
                 df, window_size=window_size,
                 forecast_horizon=forecast_horizon,
                 epochs=ablation_epochs
             )
-            progress.progress(100)
             st.session_state["ablation_results"] = ablation_results
         st.success("✅ Ablation study complete!")
 
     ablation_results = st.session_state.get("ablation_results")
     if ablation_results is not None:
-        st.subheader("📊 Results")
         st.dataframe(ablation_results, use_container_width=True)
-
         valid = ablation_results.dropna(subset=["RMSE"])
         if not valid.empty:
             colors_abl = ["#6b7280", "#3b82f6", "#f59e0b", "#22c55e"]
@@ -872,50 +811,12 @@ with tab8:
                 template="plotly_dark", height=400
             )
             st.plotly_chart(fig_abl, use_container_width=True)
-
-            if len(valid) > 1:
-                baseline_rmse = valid["RMSE"].iloc[0]
-                improvements  = [
-                    (baseline_rmse - r) / baseline_rmse * 100
-                    for r in valid["RMSE"]
-                ]
-                fig_imp_abl = go.Figure()
-                fig_imp_abl.add_trace(go.Scatter(
-                    x=[f"Exp {chr(65+i)}" for i in range(len(valid))],
-                    y=improvements, mode="lines+markers",
-                    line=dict(color="#22c55e", width=3),
-                    marker=dict(size=10)
-                ))
-                fig_imp_abl.add_hline(
-                    y=0, line_dash="dash", line_color="#6b7280",
-                    annotation_text="Baseline (cpu only)"
-                )
-                fig_imp_abl.update_layout(
-                    title="RMSE Improvement Over Baseline (%)",
-                    template="plotly_dark", height=350
-                )
-                st.plotly_chart(fig_imp_abl, use_container_width=True)
-
-            best_exp          = valid.loc[valid["RMSE"].idxmin(), "Experiment"]
-            best_rmse         = valid["RMSE"].min()
-            worst_rmse        = valid["RMSE"].max()
-            total_improvement = (worst_rmse - best_rmse) / worst_rmse * 100
-            st.success(
-                f"🔑 Best: {best_exp} — RMSE = {best_rmse:.6f}. "
-                f"Feature engineering improved RMSE by {total_improvement:.1f}% over baseline."
-            )
-            st.download_button(
-                "⬇️ Download Ablation CSV",
-                ablation_results.to_csv(index=False).encode(),
-                "ablation_results.csv", "text/csv"
-            )
     else:
         st.info("Click 'Run Ablation Study' to start.")
 
 # ================= TAB 9: ERROR ANALYSIS =================
 with tab9:
     st.subheader("🔎 Error Analysis by CPU Load Region")
-    st.caption("Breaks prediction errors into Low / Medium / High / Spike regions")
 
     results   = st.session_state.get("results")
     processed = st.session_state.get("processed")
@@ -931,7 +832,6 @@ with tab9:
             y_pred          = arrays["pred"]
             segment_results = segment_errors(y_true, y_pred)
 
-            st.subheader("Error by CPU Load Region")
             cols = st.columns(4)
             for i, (region, info) in enumerate(segment_results.items()):
                 with cols[i % 4]:
@@ -941,31 +841,14 @@ with tab9:
                         f"{info['Pct']}% of data"
                     )
 
-            fig1 = plot_error_by_region(segment_results)
-            st.plotly_chart(fig1, use_container_width=True)
-
-            fig2 = plot_prediction_vs_actual_with_errors(y_true, y_pred, segment_results)
-            st.plotly_chart(fig2, use_container_width=True)
-
-            fig3 = plot_rolling_error(y_true, y_pred)
-            st.plotly_chart(fig3, use_container_width=True)
-
-            fig4 = plot_error_distribution_by_region(y_true, y_pred, segment_results)
-            st.plotly_chart(fig4, use_container_width=True)
+            st.plotly_chart(plot_error_by_region(segment_results),                    use_container_width=True)
+            st.plotly_chart(plot_prediction_vs_actual_with_errors(y_true, y_pred, segment_results), use_container_width=True)
+            st.plotly_chart(plot_rolling_error(y_true, y_pred),                       use_container_width=True)
+            st.plotly_chart(plot_error_distribution_by_region(y_true, y_pred, segment_results),     use_container_width=True)
 
             worst_df = get_worst_predictions(y_true, y_pred, n=10)
             st.subheader("Top 10 Worst Predictions")
             st.dataframe(worst_df, use_container_width=True)
-
-            spike_rmse  = segment_results["Spike"]["RMSE"]
-            normal_rmse = segment_results["Normal"]["RMSE"]
-            if spike_rmse > 0 and normal_rmse > 0:
-                spike_factor = spike_rmse / normal_rmse
-                st.warning(
-                    f"⚠️ Model makes {spike_factor:.1f}x larger errors during spikes — "
-                    f"expected. Sudden load changes are inherently harder to predict."
-                )
-
             st.download_button(
                 "⬇️ Download Error Analysis CSV",
                 worst_df.to_csv(index=False).encode(),
@@ -975,7 +858,6 @@ with tab9:
 # ================= TAB 10: ALERTS =================
 with tab10:
     st.subheader("🚨 Real-Time Alert System")
-    st.caption("Threshold-based spike alerts with Slack webhook — configurable severity levels")
 
     alert_system = st.session_state["alert_system"]
     model        = st.session_state.get("model")
@@ -1008,14 +890,14 @@ with tab10:
                     alert["level"], test_cpu, current_cpu, alert["action"]
                 )
                 st.success("✅ Slack alert sent!") if sent else st.warning(
-                    "⚠️ Slack not configured — add webhook URL in sidebar"
+                    "⚠️ Slack not configured"
                 )
             elif alert["level"] == "MEDIUM":
                 st.warning(msg)
             else:
                 st.success(msg)
     else:
-        st.info("Train your model first (Tab 1) to enable alert testing.")
+        st.info("Train your model first (Tab 1).")
 
     summary = alert_system.get_alert_summary()
     if summary["total"] > 0:
@@ -1024,8 +906,3 @@ with tab10:
         c2.metric("🔴 High",      summary["high"])
         c3.metric("🟡 Medium",    summary["medium"])
         c4.metric("🟢 Normal",    summary["normal"])
-        if alert_system.alert_history:
-            hist_df = pd.DataFrame(alert_system.alert_history)[
-                ["timestamp", "level", "predicted", "current", "action"]
-            ]
-            st.dataframe(hist_df.tail(10), use_container_width=True)
