@@ -76,8 +76,8 @@ def build_lstm_model(
     window_size,
     num_features,
     forecast_horizon=1,
-    lstm_units=(256, 128),
-    dropout_rate=0.20,
+    lstm_units=(128,64),
+    dropout_rate=0.35,
     learning_rate=0.001,
     weight_decay=1e-4         # FIX: L2 regularization → reduces overconfidence
 ):
@@ -159,7 +159,7 @@ def train_model(
     """
     callbacks = [
         EarlyStopping(
-            monitor="val_loss", patience=20,
+            monitor="val_loss", patience=15,
             restore_best_weights=True, verbose=1
         ),
         ReduceLROnPlateau(

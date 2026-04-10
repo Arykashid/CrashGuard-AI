@@ -107,11 +107,10 @@ def ensemble_predict(lstm_pred, xgb_pred, X_windows):
 
     # Combined: statistically high OR rising fast
     spike_mask = spike_mask | rising_fast
-
     final_pred = np.where(
         spike_mask,
-        0.3 * lstm_pred + 0.7 * xgb_pred,
-        0.7 * lstm_pred + 0.3 * xgb_pred
+        0.05 * lstm_pred + 0.95 * xgb_pred,
+        0.2 * lstm_pred + 0.8 * xgb_pred
     )
 
     n_spike  = int(spike_mask.sum())

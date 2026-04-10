@@ -29,10 +29,10 @@ from calibration import find_temperature, save_temperature
 # ============================================================
 WINDOW_SIZE      = 60
 FORECAST_HORIZON = 1
-EPOCHS           = 30
+EPOCHS           = 60
 BATCH_SIZE       = 256
-LSTM_UNITS       = [256, 128]
-DROPOUT_RATE     = 0.20
+LSTM_UNITS       = [128,64]
+DROPOUT_RATE     = 0.35
 LEARNING_RATE    = 0.001
 WEIGHT_DECAY     = 1e-4
 MC_SAMPLES       = 100

@@ -100,10 +100,11 @@ def load_model():
 FEATURE_NAMES = [
     "cpu_usage", "hour_sin", "hour_cos",
     "dow_sin", "dow_cos",
-    "lag1", "lag2", "lag3", "lag5", "lag10",
-    "roll_mean_10", "roll_std_10"
+    "lag1", "lag5", "lag10", "lag2", "lag3",
+    "roll_mean_10", "roll_std_10",
+    "spike_flag", "cpu_diff1", "cpu_diff3"
 ]
-N_FEATURES = 12
+N_FEATURES = 15
 
 
 # =============================================
@@ -112,23 +113,27 @@ N_FEATURES = 12
 def build_feature_window(cpu_array):
     features = []
     for i, c in enumerate(cpu_array):
-        h         = datetime.now().hour
-        dow       = datetime.now().weekday()
-        hour_sin  = np.sin(2 * np.pi * h / 24)
-        hour_cos  = np.cos(2 * np.pi * h / 24)
-        dow_sin   = np.sin(2 * np.pi * dow / 7)
-        dow_cos   = np.cos(2 * np.pi * dow / 7)
-        lag1      = cpu_array[i - 1]  if i > 0  else c
-        lag2      = cpu_array[i - 2]  if i > 1  else c
-        lag3      = cpu_array[i - 3]  if i > 2  else c
-        lag5      = cpu_array[i - 5]  if i > 4  else c
-        lag10     = cpu_array[i - 10] if i > 9  else c
-        roll_mean = np.mean(cpu_array[max(0, i - 10):i + 1])
-        roll_std  = np.std(cpu_array[max(0, i - 10):i + 1]) + 1e-6
+        h          = datetime.now().hour
+        dow        = datetime.now().weekday()
+        hour_sin   = np.sin(2 * np.pi * h / 24)
+        hour_cos   = np.cos(2 * np.pi * h / 24)
+        dow_sin    = np.sin(2 * np.pi * dow / 7)
+        dow_cos    = np.cos(2 * np.pi * dow / 7)
+        lag1       = cpu_array[i - 1]  if i > 0  else c
+        lag2       = cpu_array[i - 2]  if i > 1  else c
+        lag3       = cpu_array[i - 3]  if i > 2  else c
+        lag5       = cpu_array[i - 5]  if i > 4  else c
+        lag10      = cpu_array[i - 10] if i > 9  else c
+        roll_mean  = np.mean(cpu_array[max(0, i - 10):i + 1])
+        roll_std   = np.std(cpu_array[max(0, i - 10):i + 1]) + 1e-6
+        spike_flag = 1.0 if c > (roll_mean + 2.0 * roll_std) else 0.0
+        cpu_diff1  = c - (cpu_array[i - 1] if i > 0 else c)
+        cpu_diff3  = c - (cpu_array[i - 3] if i > 2 else c)
         features.append([
             c, hour_sin, hour_cos, dow_sin, dow_cos,
-            lag1, lag2, lag3, lag5, lag10,
-            roll_mean, roll_std
+            lag1, lag5, lag10, lag2, lag3,
+            roll_mean, roll_std,
+            spike_flag, cpu_diff1, cpu_diff3
         ])
     return np.array(features, dtype=np.float32)
 
