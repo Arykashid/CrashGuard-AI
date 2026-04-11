@@ -382,7 +382,7 @@ def generate_evaluation_report(results, path="evaluation_report.md"):
         f"\n**LSTM beats ARIMA**: {'✅ YES' if beats_arima else '❌ NO'}",
     ]
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"  Evaluation report saved: {path}")
 

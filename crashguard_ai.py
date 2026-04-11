@@ -7,7 +7,9 @@ FINAL VERSION — ALL FIXES APPLIED:
   4. Slack webhook with Test button in sidebar
   5. Spike threshold goes to 0.10 for demo
   6. REAL Integrated Gradients replacing fake SHAP chart
-  7. 12 features matching trained model exactly
+  7. 15 features matching trained model exactly
+  8. Scaler loaded and applied for live CPU scaling
+  9. multistep_predict uses scaler correctly
 """
 from dotenv import load_dotenv
 load_dotenv()
@@ -95,7 +97,23 @@ def load_model():
 
 
 # =============================================
-# FEATURE NAMES — 12 features matching training
+# LOAD SCALERS
+# =============================================
+def load_scalers():
+    cpu_scaler = None
+    scaler     = None
+    try:
+        if os.path.exists("cpu_scaler.pkl"):
+            cpu_scaler = joblib.load("cpu_scaler.pkl")
+        if os.path.exists("scaler.pkl"):
+            scaler = joblib.load("scaler.pkl")
+    except Exception:
+        pass
+    return scaler, cpu_scaler
+
+
+# =============================================
+# FEATURE NAMES — 15 features matching training
 # =============================================
 FEATURE_NAMES = [
     "cpu_usage", "hour_sin", "hour_cos",
@@ -108,7 +126,7 @@ N_FEATURES = 15
 
 
 # =============================================
-# FEATURE BUILDER — 12 features
+# FEATURE BUILDER — 15 features
 # =============================================
 def build_feature_window(cpu_array):
     features = []
@@ -142,11 +160,6 @@ def build_feature_window(cpu_array):
 # INTEGRATED GRADIENTS — REAL EXPLAINABILITY
 # =============================================
 def compute_integrated_gradients(model, X, n_steps=30):
-    """
-    Real Integrated Gradients attribution.
-    Reference: Sundararajan et al. (2017) ICML
-    Replaces fake SHAP — mathematically correct for LSTMs.
-    """
     try:
         if X.ndim == 2:
             X = X[np.newaxis, ...]
@@ -175,14 +188,23 @@ def compute_integrated_gradients(model, X, n_steps=30):
 
 
 # =============================================
-# PREDICTION ENGINE — FIXED MC DROPOUT
+# PREDICTION ENGINE
 # =============================================
-def make_prediction(model, history, window_size=60, n_mc=30):
+def make_prediction(model, history, scaler_live, cpu_scaler_live,
+                    window_size=60, n_mc=30):
     if model is None or len(history) < window_size:
         return None, None, None
     try:
         cpu_arr  = np.array(list(history)[-window_size:])
         features = build_feature_window(cpu_arr)
+
+        # Scale features using training scaler
+        if scaler_live is not None:
+            try:
+                features = scaler_live.transform(features)
+            except Exception:
+                pass
+
         X        = features.reshape(1, window_size, N_FEATURES).astype(np.float32)
         X_tensor = tf.constant(X)
         preds    = []
@@ -194,27 +216,50 @@ def make_prediction(model, history, window_size=60, n_mc=30):
                 continue
         if not preds:
             return None, None, None
-        mean_pred  = float(np.clip(np.mean(preds), 0.0, 1.0))
-        std_pred   = float(np.std(preds))
+
+        mean_pred = float(np.mean(preds))
+        std_pred  = float(np.std(preds))
+
+        # Inverse log1p
+        mean_pred = float(np.expm1(mean_pred))
+
+        # Inverse transform prediction back to CPU scale
+        if cpu_scaler_live is not None:
+            try:
+                mean_pred = float(cpu_scaler_live.inverse_transform([[mean_pred]])[0][0])
+            except Exception:
+                pass
+
+        mean_pred  = float(np.clip(mean_pred, 0.0, 1.0))
         confidence = float(np.clip(np.exp(-std_pred / 0.05), 0.05, 1.0))
         return mean_pred, confidence, features
     except Exception:
         return None, None, None
 
 
-def multistep_predict(model, history, n_steps=5, window_size=60):
+def multistep_predict(model, history, scaler_live, cpu_scaler_live,
+                      n_steps=5, window_size=60):
     if model is None or len(history) < window_size:
         return [], []
     means, stds = [], []
     hist = list(history)[-window_size:]
     for _ in range(n_steps):
-        pred, _, _ = make_prediction(model, hist, window_size, n_mc=20)
+        pred, _, _ = make_prediction(
+            model, hist, scaler_live, cpu_scaler_live, window_size, n_mc=20
+        )
         if pred is None:
             break
-        cpu_arr    = np.array(hist[-window_size:])
-        features   = build_feature_window(cpu_arr)
-        X          = features.reshape(1, window_size, N_FEATURES).astype(np.float32)
-        X_tensor   = tf.constant(X)
+        cpu_arr  = np.array(hist[-window_size:])
+        features = build_feature_window(cpu_arr)
+
+        if scaler_live is not None:
+            try:
+                features = scaler_live.transform(features)
+            except Exception:
+                pass
+
+        X        = features.reshape(1, window_size, N_FEATURES).astype(np.float32)
+        X_tensor = tf.constant(X)
         step_preds = []
         for _ in range(15):
             try:
@@ -274,7 +319,7 @@ def check_and_fire_alert(predicted, confidence, current,
             "actions":    get_suggested_actions(severity)
         }
         st.session_state.alerts.insert(0, alert)
-        st.session_state.alerts         = st.session_state.alerts[:10]
+        st.session_state.alerts          = st.session_state.alerts[:10]
         st.session_state.last_alert_time = now
         st.session_state.alert_count    += 1
         if slack_webhook:
@@ -338,9 +383,10 @@ def get_health_status(current, predicted):
 
 
 # =============================================
-# LOAD MODEL + SIDEBAR
+# LOAD MODEL + SCALERS
 # =============================================
-model = load_model()
+model                    = load_model()
+scaler_live, cpu_scaler_live = load_scalers()
 
 with st.sidebar:
     st.markdown("### ⚙️ CrashGuard Config")
@@ -367,21 +413,22 @@ with st.sidebar:
                 st.error(f"❌ {e}")
 
     st.divider()
-    spike_thresh  = st.slider("🎯 Spike Threshold", 0.10, 0.95, 0.75, 0.05,
-                               help="Lower to 0.10 during demo to trigger alerts")
-    demo_mode = st.toggle("🎬 Demo Mode", value=True,
-                       help="ON = easy alerts for demo | OFF = strict production rules")
-    auto_refresh  = st.toggle("🔄 Auto-Refresh (5s)", value=True)
-    window_size   = st.select_slider("Window Size", [20, 30, 40, 60], value=60)
-    n_forecast    = st.slider("Forecast Steps", 3, 20, 5)
-    n_mc_samples  = st.slider("MC Samples", 10, 50, 30)
+    spike_thresh = st.slider("🎯 Spike Threshold", 0.10, 0.95, 0.75, 0.05,
+                              help="Lower to 0.10 during demo to trigger alerts")
+    demo_mode    = st.toggle("🎬 Demo Mode", value=True,
+                              help="ON = easy alerts for demo | OFF = strict production rules")
+    auto_refresh = st.toggle("🔄 Auto-Refresh (5s)", value=True)
+    window_size  = st.select_slider("Window Size", [20, 30, 40, 60], value=60)
+    n_forecast   = st.slider("Forecast Steps", 3, 20, 5)
+    n_mc_samples = st.slider("MC Samples", 10, 50, 30)
     st.divider()
     st.markdown(f"**Model:** {'✅ Loaded' if model else '❌ Not loaded'}")
+    st.markdown(f"**Scaler:** {'✅ Loaded' if scaler_live else '❌ Not found'}")
     st.markdown(f"**Features:** {N_FEATURES}")
     st.markdown(f"**Alerts fired:** {st.session_state.alert_count}")
     st.markdown(f"**Data points:** {len(st.session_state.cpu_history)}")
     if model is None:
-        st.error("❌ Train model in app.py first")
+        st.error("❌ Run train.py first")
 
 # =============================================
 # PREWARM + COLLECT DATA
@@ -394,11 +441,15 @@ st.session_state.cpu_history.append(current_cpu)
 st.session_state.time_history.append(now)
 
 predicted_cpu, confidence, last_features = make_prediction(
-    model, st.session_state.cpu_history, window_size, n_mc=n_mc_samples
+    model, st.session_state.cpu_history,
+    scaler_live, cpu_scaler_live,
+    window_size, n_mc=n_mc_samples
 )
 
 multistep_means, multistep_stds = multistep_predict(
-    model, st.session_state.cpu_history, n_forecast, window_size
+    model, st.session_state.cpu_history,
+    scaler_live, cpu_scaler_live,
+    n_forecast, window_size
 )
 
 if predicted_cpu is not None:
@@ -478,7 +529,7 @@ with c3:
         <div class='metric-value' style='color:{pc};'>{predicted_cpu:.1%}</div></div>""",
         unsafe_allow_html=True)
 with c4:
-    spike_text = f"{time_to_spike // 60}min" if time_to_spike else "No spike"
+    spike_text  = f"{time_to_spike // 60}min" if time_to_spike else "No spike"
     spike_color = "#ef4444" if time_to_spike else "#22c55e"
     st.markdown(f"""<div class='metric-card'>
         <div class='metric-label'>Time to Spike</div>
@@ -587,11 +638,15 @@ with left_col:
                     border-radius:8px; padding:14px; font-size:13px;'>
             <div style='margin-bottom:8px;'>
                 <span style='color:#64748b;'>Model:</span>
-                <span style='color:#e2e8f0; float:right;'>LSTM</span></div>
+                <span style='color:#e2e8f0; float:right;'>LSTM + XGBoost</span></div>
             <div style='margin-bottom:8px;'>
                 <span style='color:#64748b;'>Status:</span>
                 <span style='color:#22c55e; float:right;'>
                     {'✅ Loaded' if model else '❌ Not loaded'}</span></div>
+            <div style='margin-bottom:8px;'>
+                <span style='color:#64748b;'>Scaler:</span>
+                <span style='color:#22c55e; float:right;'>
+                    {'✅ Loaded' if scaler_live else '❌ Missing'}</span></div>
             <div style='margin-bottom:8px;'>
                 <span style='color:#64748b;'>Confidence:</span>
                 <span style='color:{conf_color}; float:right;'>{conf_val:.3f}</span></div>

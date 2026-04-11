@@ -1,33 +1,33 @@
 {
-  "trained_at": "2026-04-08T21:30:37.521760",
+  "trained_at": "2026-04-11T14:25:27.348997",
   "config": {
     "window_size": 60,
     "forecast_horizon": 1,
-    "epochs_run": 41,
-    "epochs_max": 80,
+    "epochs_run": 22,
     "batch_size": 256,
     "lstm_units": [
       128,
       64
     ],
-    "dropout_rate": 0.3,
+    "dropout_rate": 0.35,
+    "weight_decay": 0.0001,
     "learning_rate": 0.001,
     "mc_samples": 100,
     "num_features": 15,
-    "train_rows": 60000,
-    "spike_threshold_scaled": 0.542
+    "log1p_target": true,
+    "calibration_T": 9.4742
   },
   "metrics": {
-    "RMSE": 0.236884,
-    "MAE": 0.191952,
-    "Coverage_95": 0.197,
-    "Confidence": 0.9332,
-    "Avg_CI_Width": 0.131428,
-    "MC_Std_Median": 0.031734,
-    "Spike_RMSE": 0.25344,
-    "Normal_RMSE": 0.236079,
-    "Final_Train_Loss": 0.079792,
-    "Final_Val_Loss": 0.032918,
-    "Best_Val_Loss": 0.029973
+    "LSTM_RMSE": 0.232763,
+    "Ensemble_RMSE": 0.157781,
+    "LSTM_MAE": 0.20152,
+    "Ensemble_MAE": 0.116521,
+    "Coverage_90": 0.1435,
+    "Confidence": 0.9367,
+    "Avg_CI_Width": 0.128103,
+    "Spike_RMSE": 0.477094,
+    "Normal_RMSE": 0.124059,
+    "Best_Val_Loss": 0.020441,
+    "Calibration_T": 9.4742
   }
 }

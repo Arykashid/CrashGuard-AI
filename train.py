@@ -274,6 +274,8 @@ save_temperature(T, "calibration_temperature.pkl")
 # ============================================================
 print("\n[7/7] Saving...")
 joblib.dump(model, "saved_model.pkl")
+joblib.dump(scaler, "scaler.pkl")
+joblib.dump(cpu_scaler, "cpu_scaler.pkl")
 try:
     model.save("saved_model.keras")
     print("✅ Saved: saved_model.keras + saved_model.pkl")
