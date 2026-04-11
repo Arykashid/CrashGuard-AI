@@ -1,4 +1,14 @@
-# CrashGuard AI — Predictive CPU Observability Platform
+﻿---
+title: CrashGuard AI
+emoji: shield
+colorFrom: blue
+colorTo: red
+sdk: docker
+app_file: crashguard_ai.py
+pinned: false
+---
+
+# CrashGuard AI â€” Predictive CPU Observability Platform
 
 <div align="center">
 
@@ -10,7 +20,7 @@
 [![MLflow](https://img.shields.io/badge/MLflow-Tracked-blue?style=flat-square&logo=mlflow)](https://mlflow.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
-[🚀 Live Demo](https://YOUR_STREAMLIT_URL.streamlit.app) · [📊 Research Dashboard](https://YOUR_STREAMLIT_URL.streamlit.app) · [📧 Contact](mailto:arykashid65@gmail.com)
+[ðŸš€ Live Demo](https://YOUR_STREAMLIT_URL.streamlit.app) Â· [ðŸ“Š Research Dashboard](https://YOUR_STREAMLIT_URL.streamlit.app) Â· [ðŸ“§ Contact](mailto:arykashid65@gmail.com)
 
 </div>
 
@@ -18,7 +28,7 @@
 
 ## The Problem
 
-Production systems fail **reactively**. Current observability tools — Datadog, Grafana, Prometheus — detect CPU spikes *after* they occur. By then the damage is done: latency spikes, dropped requests, engineers woken at 3am.
+Production systems fail **reactively**. Current observability tools â€” Datadog, Grafana, Prometheus â€” detect CPU spikes *after* they occur. By then the damage is done: latency spikes, dropped requests, engineers woken at 3am.
 
 **CrashGuard AI shifts infrastructure monitoring from reactive detection to predictive alerting** using LSTM-based time series forecasting with calibrated uncertainty quantification.
 
@@ -36,15 +46,15 @@ Trained and evaluated on **60,000 timesteps** from the Google Cluster Trace data
 | Naive | 0.068 | 0.051 | Persistence baseline |
 
 **Uncertainty Quantification**
-- Coverage @ 95% CI: **0.973** (target: 0.90–0.98) ✅
-- ECE (Expected Calibration Error): **< 0.05** — well calibrated ✅
-- Walk-forward RMSE: **0.047 ± 0.012** (stable across all folds)
+- Coverage @ 95% CI: **0.973** (target: 0.90â€“0.98) âœ…
+- ECE (Expected Calibration Error): **< 0.05** â€” well calibrated âœ…
+- Walk-forward RMSE: **0.047 Â± 0.012** (stable across all folds)
 
 **Statistical Validation**
-- Diebold-Mariano test: p = 0.000 — LSTM **statistically significantly** better than ARIMA ✅
-- Ljung-Box test on residuals: no autocorrelation remaining ✅
+- Diebold-Mariano test: p = 0.000 â€” LSTM **statistically significantly** better than ARIMA âœ…
+- Ljung-Box test on residuals: no autocorrelation remaining âœ…
 
-> 📌 **Update these numbers** after running `Evaluate Model` in app.py
+> ðŸ“Œ **Update these numbers** after running `Evaluate Model` in app.py
 
 ---
 
@@ -52,9 +62,9 @@ Trained and evaluated on **60,000 timesteps** from the Google Cluster Trace data
 
 ARIMA assumes **linear autoregressive dynamics**. Real CPU workloads exhibit three things ARIMA cannot model:
 
-1. **Nonlinear regime changes** — deployment events, traffic bursts
-2. **Diurnal seasonality with interaction effects** — load patterns differ by hour AND day
-3. **Heteroscedastic noise** — variance increases with load level
+1. **Nonlinear regime changes** â€” deployment events, traffic bursts
+2. **Diurnal seasonality with interaction effects** â€” load patterns differ by hour AND day
+3. **Heteroscedastic noise** â€” variance increases with load level
 
 LSTM captures all three. Validated with the Diebold-Mariano test (Diebold & Mariano, 1995).
 
@@ -64,9 +74,9 @@ LSTM captures all three. Validated with the Diebold-Mariano test (Diebold & Mari
 
 ![CrashGuard AI System Architecture](assets/architecture.png)
 
-**Full pipeline:** Google Cluster Data + psutil → Preprocessing (MinMax scaling, 12 features, sliding window 60) → LSTM Model → MC Dropout (50 forward passes) → Mean Prediction + Uncertainty (Std Dev) → Final Forecast → Confidence Interval → Decision Engine → Slack Alerts / Live Dashboard / Auto Scaling Decision
+**Full pipeline:** Google Cluster Data + psutil â†’ Preprocessing (MinMax scaling, 12 features, sliding window 60) â†’ LSTM Model â†’ MC Dropout (50 forward passes) â†’ Mean Prediction + Uncertainty (Std Dev) â†’ Final Forecast â†’ Confidence Interval â†’ Decision Engine â†’ Slack Alerts / Live Dashboard / Auto Scaling Decision
 
-**Tracking & Experiments layer:** MLflow Tracking · Optuna Tuning · Ablation Study · PDF Reports running alongside the main pipeline.
+**Tracking & Experiments layer:** MLflow Tracking Â· Optuna Tuning Â· Ablation Study Â· PDF Reports running alongside the main pipeline.
 
 > 
 
@@ -79,41 +89,41 @@ LSTM captures all three. Validated with the Diebold-Mariano test (Diebold & Mari
 Standard neural networks produce point estimates with no confidence measure. CrashGuard uses MC Dropout to approximate Bayesian inference:
 
 ```python
-# Custom MCDropout — stays active at inference time
+# Custom MCDropout â€” stays active at inference time
 # Fixes the model.predict() bug where standard Dropout is disabled
 @tf.keras.utils.register_keras_serializable()
 class MCDropout(tf.keras.layers.Layer):
     def call(self, inputs, training=None):
-        # tf.nn.dropout has no training-mode gating — always active
+        # tf.nn.dropout has no training-mode gating â€” always active
         return tf.nn.dropout(inputs, rate=self.rate)
 ```
 
-50 stochastic forward passes → distribution over predictions → calibrated 95% CI.
+50 stochastic forward passes â†’ distribution over predictions â†’ calibrated 95% CI.
 
 **Total predictive uncertainty** = epistemic (MC Dropout) + aleatoric (residual noise):
 ```
-total_std = sqrt(mc_std² + residual_std²)
+total_std = sqrt(mc_stdÂ² + residual_stdÂ²)
 ```
-This is the standard Bayesian decomposition (Kendall & Gal, 2017). Coverage improves from 0.06 → 0.97.
+This is the standard Bayesian decomposition (Kendall & Gal, 2017). Coverage improves from 0.06 â†’ 0.97.
 
 ### Explainability via Integrated Gradients (Sundararajan et al., 2017)
 
 Why not SHAP for LSTMs:
-- KernelSHAP treats each timestep×feature as independent — incorrect for sequential models
+- KernelSHAP treats each timestepÃ—feature as independent â€” incorrect for sequential models
 - Integrated Gradients respects temporal structure of the input
-- IG satisfies the **Completeness axiom**: Σ attributions = model(input) − model(baseline)
+- IG satisfies the **Completeness axiom**: Î£ attributions = model(input) âˆ’ model(baseline)
 
 ### Walk-Forward Validation (Not K-Fold)
 
-Time series exhibit temporal dependencies. K-fold leaks future data into training. Walk-forward always trains on the past and tests on the future — matching the actual deployment scenario.
+Time series exhibit temporal dependencies. K-fold leaks future data into training. Walk-forward always trains on the past and tests on the future â€” matching the actual deployment scenario.
 
 ### LayerNorm over BatchNorm
 
-During MC Dropout sampling (batch size = 1, repeated 50×), BatchNorm statistics are unstable and add non-dropout randomness that corrupts uncertainty estimates. LayerNorm normalizes over the feature dimension — unaffected by MC sampling.
+During MC Dropout sampling (batch size = 1, repeated 50Ã—), BatchNorm statistics are unstable and add non-dropout randomness that corrupts uncertainty estimates. LayerNorm normalizes over the feature dimension â€” unaffected by MC sampling.
 
 ### Huber Loss over MSE
 
-MSE penalizes large errors quadratically, causing the optimizer to sacrifice spike accuracy to reduce average error. Huber loss transitions to linear penalty beyond threshold δ — robust to spike outliers, smooth gradients for normal operation.
+MSE penalizes large errors quadratically, causing the optimizer to sacrifice spike accuracy to reduce average error. Huber loss transitions to linear penalty beyond threshold Î´ â€” robust to spike outliers, smooth gradients for normal operation.
 
 ---
 
@@ -121,17 +131,17 @@ MSE penalizes large errors quadratically, causing the optimizer to sacrifice spi
 
 | Capability | CrashGuard AI | Datadog |
 |-----------|---------------|---------|
-| Real-time CPU monitoring | ✅ | ✅ |
-| Threshold-based alerts | ✅ | ✅ |
-| **Predictive alerting (pre-spike)** | ✅ | ❌ |
-| **Calibrated uncertainty (95% CI)** | ✅ | ❌ |
-| **Feature-level explainability (IG)** | ✅ | ❌ |
-| Statistical model validation (DM test) | ✅ | ❌ |
-| MLflow experiment tracking | ✅ | ❌ |
-| Multi-step forecast | ✅ | ❌ |
-| Ablation study | ✅ | ❌ |
-| Production infrastructure agents | ❌ | ✅ |
-| Enterprise scale | ❌ | ✅ |
+| Real-time CPU monitoring | âœ… | âœ… |
+| Threshold-based alerts | âœ… | âœ… |
+| **Predictive alerting (pre-spike)** | âœ… | âŒ |
+| **Calibrated uncertainty (95% CI)** | âœ… | âŒ |
+| **Feature-level explainability (IG)** | âœ… | âŒ |
+| Statistical model validation (DM test) | âœ… | âŒ |
+| MLflow experiment tracking | âœ… | âŒ |
+| Multi-step forecast | âœ… | âŒ |
+| Ablation study | âœ… | âŒ |
+| Production infrastructure agents | âŒ | âœ… |
+| Enterprise scale | âŒ | âœ… |
 
 CrashGuard AI's defensible edge: **uncertainty-calibrated predictive alerting with explainability**. This is the one capability Datadog does not have and cannot easily add.
 
@@ -161,7 +171,7 @@ streamlit run crashguard_ai.py
 python worker.py
 ```
 
-**Inside app.py — run in this order:**
+**Inside app.py â€” run in this order:**
 1. Prepare Data
 2. Train Model (~25 min on CPU, ~5 min on GPU)
 3. Evaluate Model (~10 min in fast mode)
@@ -173,27 +183,27 @@ python worker.py
 
 ```
 CrashGuard-AI/
-├── app.py                  # Research dashboard (training, evaluation, SHAP, ablation)
-├── crashguard_ai.py        # Production dashboard (live monitoring, alerts)
-├── worker.py               # Background 24/7 prediction + alert loop
-├── lstm_model.py           # LSTM + TCN + Transformer + MC Dropout
-├── preprocessing.py        # 12-feature engineering + leakage-safe scaling
-├── evaluate.py             # Full evaluation: ARIMA, Prophet, walk-forward, ECE
-├── live_monitor.py         # Real-time psutil CPU inference pipeline
-├── notifications.py        # Slack webhook alerts
-├── mlflow_tracker.py       # Experiment tracking + best run selection
-├── optuna_tuning.py        # Bayesian hyperparameter search (20 trials)
-├── ablation_study.py       # Feature contribution analysis (4 experiments)
-├── shap_explainer.py       # Integrated Gradients explainability
-├── multistep_forecast.py   # MC Dropout multi-step forecasting
-├── anomaly_detection.py    # Isolation Forest + Z-Score dual detection
-├── run_experiments.py      # 5-seed experiment runner
-├── train.py                # Full retraining pipeline
-├── data/
-│   └── google_cluster_processed.csv   # 60K Google Cluster Trace rows
-├── .env.example            # Environment variable template
-├── requirements.txt
-└── README.md
+â”œâ”€â”€ app.py                  # Research dashboard (training, evaluation, SHAP, ablation)
+â”œâ”€â”€ crashguard_ai.py        # Production dashboard (live monitoring, alerts)
+â”œâ”€â”€ worker.py               # Background 24/7 prediction + alert loop
+â”œâ”€â”€ lstm_model.py           # LSTM + TCN + Transformer + MC Dropout
+â”œâ”€â”€ preprocessing.py        # 12-feature engineering + leakage-safe scaling
+â”œâ”€â”€ evaluate.py             # Full evaluation: ARIMA, Prophet, walk-forward, ECE
+â”œâ”€â”€ live_monitor.py         # Real-time psutil CPU inference pipeline
+â”œâ”€â”€ notifications.py        # Slack webhook alerts
+â”œâ”€â”€ mlflow_tracker.py       # Experiment tracking + best run selection
+â”œâ”€â”€ optuna_tuning.py        # Bayesian hyperparameter search (20 trials)
+â”œâ”€â”€ ablation_study.py       # Feature contribution analysis (4 experiments)
+â”œâ”€â”€ shap_explainer.py       # Integrated Gradients explainability
+â”œâ”€â”€ multistep_forecast.py   # MC Dropout multi-step forecasting
+â”œâ”€â”€ anomaly_detection.py    # Isolation Forest + Z-Score dual detection
+â”œâ”€â”€ run_experiments.py      # 5-seed experiment runner
+â”œâ”€â”€ train.py                # Full retraining pipeline
+â”œâ”€â”€ data/
+â”‚   â””â”€â”€ google_cluster_processed.csv   # 60K Google Cluster Trace rows
+â”œâ”€â”€ .env.example            # Environment variable template
+â”œâ”€â”€ requirements.txt
+â””â”€â”€ README.md
 ```
 
 ---
@@ -202,7 +212,7 @@ CrashGuard-AI/
 
 Run Tab 8 in app.py to reproduce. Each experiment adds one feature group:
 
-| Experiment | Features Added | RMSE | Δ vs Baseline |
+| Experiment | Features Added | RMSE | Î” vs Baseline |
 |-----------|---------------|------|---------------|
 | A | cpu_usage only | 0.1723 | baseline |
 | B | + cyclic time encoding | 0.1732 | +0.5%|
@@ -223,9 +233,9 @@ This suggests sequence models already capture temporal dependencies, while extra
 
 3. Sundararajan, M., Taly, A., & Yan, Q. (2017). Axiomatic Attribution for Deep Networks. *ICML 2017*.
 
-4. Diebold, F. X., & Mariano, R. S. (1995). Comparing Predictive Accuracy. *Journal of Business & Economic Statistics, 13*(3), 253–263.
+4. Diebold, F. X., & Mariano, R. S. (1995). Comparing Predictive Accuracy. *Journal of Business & Economic Statistics, 13*(3), 253â€“263.
 
-5. Hochreiter, S., & Schmidhuber, J. (1997). Long Short-Term Memory. *Neural Computation, 9*(8), 1735–1780.
+5. Hochreiter, S., & Schmidhuber, J. (1997). Long Short-Term Memory. *Neural Computation, 9*(8), 1735â€“1780.
 
 6. Google Cluster Trace. (2019). Google Cluster Workload Traces. *Google Research*.
 
@@ -233,8 +243,9 @@ This suggests sequence models already capture temporal dependencies, while extra
 
 <div align="center">
 
-Built by **Ary Kashid** · (mailto:arykashid65@gmail.com)
+Built by **Ary Kashid** Â· (mailto:arykashid65@gmail.com)
 
-⭐ Star this repo if it helped you · [GitHub](https://github.com/Arykashid/CrashGuard-AI)
+â­ Star this repo if it helped you Â· [GitHub](https://github.com/Arykashid/CrashGuard-AI)
 
 </div>
+
