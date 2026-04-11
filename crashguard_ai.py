@@ -26,7 +26,7 @@ from datetime import datetime
 from collections import deque
 
 # =============================================
-# PAGE CONFIG
+# PAGE CONFIG — MUST BE FIRST STREAMLIT CALL
 # =============================================
 st.set_page_config(
     page_title="CrashGuard AI",
@@ -35,6 +35,65 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# =============================================
+# LOGIN GATE
+# =============================================
+def check_login():
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+
+    if not st.session_state.logged_in:
+        st.markdown("""
+        <style>
+            .stApp { background-color: #0f172a; color: #ffffff; }
+            #MainMenu {visibility: hidden;}
+            footer {visibility: hidden;}
+            header {visibility: hidden;}
+        </style>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.markdown("""
+            <div style='text-align:center; margin-bottom:32px;'>
+                <span style='font-size:48px;'>🛡️</span>
+                <h1 style='color:white; margin:8px 0 4px 0;'>CrashGuard AI</h1>
+                <p style='color:#64748b; font-size:14px;'>CPU Observability Platform — Pro Plan</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("""
+            <div style='background:#1e293b; border-radius:12px; padding:28px;
+                        border:1px solid #2d3748;'>
+            """, unsafe_allow_html=True)
+
+            username = st.text_input("📧 Email", placeholder="demo@crashguard.ai")
+            password = st.text_input("🔒 Password", type="password", placeholder="••••••••")
+
+            if st.button("Sign In →", use_container_width=True, type="primary"):
+                if username == "demo@crashguard.ai" and password == "demo123":
+                    st.session_state.logged_in = True
+                    st.session_state.plan = "Pro"
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid credentials")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("""
+            <div style='text-align:center; margin-top:16px;'>
+                <span style='color:#475569; font-size:12px;'>
+                    Demo credentials: demo@crashguard.ai / demo123
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+        st.stop()
+
+check_login()
+
+# =============================================
+# GLOBAL STYLES
+# =============================================
 st.markdown("""
 <style>
     .stApp { background-color: #0f172a; color: #ffffff; }
@@ -198,7 +257,6 @@ def make_prediction(model, history, scaler_live, cpu_scaler_live,
         cpu_arr  = np.array(list(history)[-window_size:])
         features = build_feature_window(cpu_arr)
 
-        # Scale features using training scaler
         if scaler_live is not None:
             try:
                 features = scaler_live.transform(features)
@@ -220,10 +278,8 @@ def make_prediction(model, history, scaler_live, cpu_scaler_live,
         mean_pred = float(np.mean(preds))
         std_pred  = float(np.std(preds))
 
-        # Inverse log1p
         mean_pred = float(np.expm1(mean_pred))
 
-        # Inverse transform prediction back to CPU scale
         if cpu_scaler_live is not None:
             try:
                 mean_pred = float(cpu_scaler_live.inverse_transform([[mean_pred]])[0][0])
@@ -390,6 +446,11 @@ scaler_live, cpu_scaler_live = load_scalers()
 
 with st.sidebar:
     st.markdown("### ⚙️ CrashGuard Config")
+    st.markdown(f"**Plan:** 🏆 {st.session_state.get('plan', 'Pro')}")
+    if st.button("🚪 Sign Out"):
+        st.session_state.logged_in = False
+        st.rerun()
+    st.divider()
     default_webhook = os.getenv("SLACK_WEBHOOK_URL", "")
     slack_webhook   = st.text_input(
         "🔔 Slack Webhook URL",
