@@ -68,7 +68,7 @@ LSTM captures all three. Validated with the Diebold-Mariano test (Diebold & Mari
 
 **Tracking & Experiments layer:** MLflow Tracking · Optuna Tuning · Ablation Study · PDF Reports running alongside the main pipeline.
 
-> 📌 Save your architecture diagram as `assets/architecture.png` in the repo root.
+> 
 
 ---
 
@@ -204,12 +204,14 @@ Run Tab 8 in app.py to reproduce. Each experiment adds one feature group:
 
 | Experiment | Features Added | RMSE | Δ vs Baseline |
 |-----------|---------------|------|---------------|
-| A | cpu_usage only | 0.0XX | baseline |
-| B | + cyclic time encoding | 0.0XX | −XX% |
-| C | + lag features (lag1,2,3,5,10) | 0.0XX | −XX% |
-| D | + rolling statistics | 0.0XX | −XX% |
+| A | cpu_usage only | 0.1723 | baseline |
+| B | + cyclic time encoding | 0.1732 | +0.5%|
+| C | + lag features (lag1,2,3,5,10) | 0.1761| +2.2% |
+| D | + rolling statistics | 0.1723 |  0.0%  |
 
-> 📌 Fill in after running ablation study
+> Insight:
+Additional engineered features did not improve LSTM performance.
+This suggests sequence models already capture temporal dependencies, while extra features introduce redundancy.
 
 ---
 
@@ -231,7 +233,7 @@ Run Tab 8 in app.py to reproduce. Each experiment adds one feature group:
 
 <div align="center">
 
-Built by **Ary Kashid** · [arykashid65@gmail.com](mailto:arykashid65@gmail.com)
+Built by **Ary Kashid** · (mailto:arykashid65@gmail.com)
 
 ⭐ Star this repo if it helped you · [GitHub](https://github.com/Arykashid/CrashGuard-AI)
 
