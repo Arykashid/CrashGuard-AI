@@ -1,6 +1,6 @@
 ﻿---
 title: CrashGuard AI
-emoji: shield
+emoji: 🛡️
 colorFrom: blue
 colorTo: red
 sdk: docker
@@ -248,4 +248,5 @@ Built by **Ary Kashid** Â· (mailto:arykashid65@gmail.com)
 â­ Star this repo if it helped you Â· [GitHub](https://github.com/Arykashid/CrashGuard-AI)
 
 </div>
+
 
