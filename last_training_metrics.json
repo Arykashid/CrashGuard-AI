@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-04-11T14:25:27.348997",
+  "trained_at": "2026-04-12T21:04:19.324768",
   "config": {
     "window_size": 60,
     "forecast_horizon": 1,

@@ -11,6 +11,7 @@ import time
 import joblib
 import os
 import requests
+from notifications import send_slack_alert as rich_slack_alert
 import tensorflow as tf
 from datetime import datetime
 from collections import deque
