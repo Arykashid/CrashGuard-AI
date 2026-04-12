@@ -22,7 +22,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
 st.markdown("""
 <style>
     .stApp { background-color: #0f172a; color: #ffffff; }
@@ -147,7 +146,7 @@ def compute_integrated_gradients(model, X, n_steps=30):
         return None
 
 
-def make_prediction(model, history, scaler_live, cpu_scaler_live, window_size=60, n_mc=30):
+def make_prediction(model, history, scaler_live, cpu_scaler_live, window_size=60, n_mc=15):
     if model is None or len(history) < window_size:
         return None, None, None
     try:
@@ -190,7 +189,7 @@ def multistep_predict(model, history, scaler_live, cpu_scaler_live, n_steps=5, w
     means, stds = [], []
     hist = list(history)[-window_size:]
     for _ in range(n_steps):
-        pred, _, _ = make_prediction(model, hist, scaler_live, cpu_scaler_live, window_size, n_mc=20)
+        pred, _, _ = make_prediction(model, hist, scaler_live, cpu_scaler_live, window_size, n_mc=8)
         if pred is None:
             break
         cpu_arr = np.array(hist[-window_size:])
@@ -203,7 +202,7 @@ def multistep_predict(model, history, scaler_live, cpu_scaler_live, n_steps=5, w
         X = features.reshape(1, window_size, N_FEATURES).astype(np.float32)
         X_tensor = tf.constant(X)
         step_preds = []
-        for _ in range(15):
+        for _ in range(8):
             try:
                 p = float(model(X_tensor, training=True).numpy().flatten()[0])
                 step_preds.append(p)
@@ -277,7 +276,7 @@ def get_suggested_actions(severity):
     if severity == "HIGH":
         return ["Scale instance immediately", "Restart high-CPU services"]
     elif severity == "MEDIUM":
-        return ["Monitor closely", "Pre-warm standby instance"]
+        return ["Monitor slowly", "Pre-warm standby instance"]
     return ["No immediate action needed"]
 
 
@@ -310,8 +309,17 @@ def get_health_status(current, predicted):
     return "HEALTHY", "#22c55e", "🟢"
 
 
-model = load_model()
-scaler_live, cpu_scaler_live = load_scalers()
+# ── CACHED model loading — loads once, reused across all reruns ──
+@st.cache_resource
+def get_model():
+    return load_model()
+
+@st.cache_resource
+def get_scalers():
+    return load_scalers()
+
+model = get_model()
+scaler_live, cpu_scaler_live = get_scalers()
 
 with st.sidebar:
     st.markdown("### ⚙️ CrashGuard Config")
@@ -337,7 +345,7 @@ with st.sidebar:
     auto_refresh = st.toggle("🔄 Auto-Refresh (5s)", value=True)
     window_size = st.select_slider("Window Size", [20, 30, 40, 60], value=60)
     n_forecast = st.slider("Forecast Steps", 3, 20, 5)
-    n_mc_samples = st.slider("MC Samples", 10, 50, 30)
+    n_mc_samples = st.slider("MC Samples", 10, 50, 15)
     st.divider()
     st.markdown(f"**Model:** {'✅ Loaded' if model else '❌ Not loaded'}")
     st.markdown(f"**Scaler:** {'✅ Loaded' if scaler_live else '❌ Not found'}")
@@ -380,12 +388,14 @@ for i, p in enumerate(multistep_means):
         time_to_spike = (i + 1) * 60
         break
 
+# ── Integrated Gradients — disabled on Railway to save memory ──
 if model is not None and last_features is not None:
     if st.session_state.ig_values is None:
-        ig_vals = compute_integrated_gradients(model, last_features)
-        if ig_vals is not None:
-            st.session_state.ig_values = ig_vals
-            st.session_state.ig_feature_names = FEATURE_NAMES
+        if os.getenv("DEMO_ENV", "local") != "railway":
+            ig_vals = compute_integrated_gradients(model, last_features)
+            if ig_vals is not None:
+                st.session_state.ig_values = ig_vals
+                st.session_state.ig_feature_names = FEATURE_NAMES
 
 st.markdown(f"""
 <div style='background:#111827; padding:12px 20px; border-radius:10px;
@@ -472,9 +482,9 @@ with left_col:
                                         textposition="auto", textfont=dict(size=9)))
             fig_cores.add_hline(y=80, line_dash="dash", line_color="#ef4444", opacity=0.4)
             fig_cores.update_layout(paper_bgcolor="#111827", plot_bgcolor="#0a0e1a",
-                                      font=dict(color="#94a3b8", size=10),
-                                      xaxis=dict(gridcolor="#1e293b"), yaxis=dict(gridcolor="#1e293b", range=[0, 105]),
-                                      height=200, margin=dict(l=30, r=10, t=20, b=30), showlegend=False)
+                                     font=dict(color="#94a3b8", size=10),
+                                     xaxis=dict(gridcolor="#1e293b"), yaxis=dict(gridcolor="#1e293b", range=[0, 105]),
+                                     height=200, margin=dict(l=30, r=10, t=20, b=30), showlegend=False)
             st.plotly_chart(fig_cores, use_container_width=True)
         else:
             st.warning("⚠️ No per-core CPU data available")
