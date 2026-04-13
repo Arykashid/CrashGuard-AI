@@ -11,7 +11,7 @@ import time
 import joblib
 import os
 import requests
-from notifications import send_slack_alert as rich_slack_alert
+import json
 import tensorflow as tf
 from datetime import datetime
 from collections import deque
@@ -54,6 +54,82 @@ for key, default in [
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+
+# ── Rich Slack alert using blocks ──
+def send_rich_slack_alert(alert, webhook_url):
+    """Sends a professional rich Slack block alert."""
+    try:
+        level = alert["severity"]
+        predicted = alert["predicted"]
+        current = alert["current"]
+        confidence = alert["confidence"]
+        actions = alert["actions"]
+        causes = alert["causes"]
+        timestamp = alert["timestamp"]
+
+        emoji = "🔴" if level == "HIGH" else "🟡" if level == "MEDIUM" else "🟢"
+        time_estimate = "~2 minutes" if level == "HIGH" else "~5 minutes"
+        action_text = " | ".join(actions)
+        causes_text = "\n".join([f"• {c}" for c in causes])
+
+        message = {
+            "text": f"{emoji} CrashGuard AI — CPU SPIKE PREDICTED — {level}",
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"{emoji} CPU SPIKE PREDICTED — {level}"
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": "*Server:*\nnode-1"},
+                        {"type": "mrkdwn", "text": f"*Current CPU:*\n{current:.1%}"},
+                        {"type": "mrkdwn", "text": f"*Predicted CPU:*\n{predicted:.1%} (in {time_estimate})"},
+                        {"type": "mrkdwn", "text": f"*Confidence:*\n{confidence:.2f}"},
+                        {"type": "mrkdwn", "text": f"*Time:*\n{timestamp}"},
+                        {"type": "mrkdwn", "text": f"*Severity:*\n{level}"}
+                    ]
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Root Causes:*\n{causes_text}"
+                    }
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Suggested Actions:*\n{action_text}"
+                    }
+                },
+                {"type": "divider"},
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": "🛡️ CrashGuard AI — CPU Observability Platform | Predictive Alerting"
+                        }
+                    ]
+                }
+            ]
+        }
+
+        response = requests.post(
+            webhook_url,
+            data=json.dumps(message),
+            headers={"Content-Type": "application/json"},
+            timeout=5
+        )
+        return response.status_code == 200
+    except Exception as e:
+        return False
 
 
 def load_model():
@@ -231,29 +307,51 @@ def prewarm_history(window_size):
 
 ALERT_COOLDOWN = 300
 
-
 def check_and_fire_alert(predicted, confidence, current, spike_threshold, slack_webhook=None, demo_mode=True):
+
+    # ⛔ Safety check
+    if predicted is None:
+        return None   # ✅ must be indented
+
     now = datetime.now()
-    if st.session_state.last_alert_time:
-        elapsed = (now - st.session_state.last_alert_time).seconds
-        if elapsed < ALERT_COOLDOWN:
-            return None
-    if predicted > spike_threshold and (demo_mode or confidence > 0.3):
-        severity = "HIGH" if predicted > 0.85 else "MEDIUM" if predicted > 0.75 else "LOW"
+
+    # Initialize state
+    if "last_alert_time" not in st.session_state:
+        st.session_state.last_alert_time = None
+
+    alert = None
+
+    # cooldown for demo (30 seconds)
+    COOLDOWN_SECONDS = 30
+
+    cooldown_passed = (
+        st.session_state.last_alert_time is None or
+        (now - st.session_state.last_alert_time).total_seconds() > COOLDOWN_SECONDS
+    )
+
+    if predicted > spike_threshold and cooldown_passed and (demo_mode or confidence > 0.3):
+
+        severity = "HIGH" if predicted > 0.7 else "MEDIUM" if predicted > 0.5 else "LOW"
+
         alert = {
-            "severity": severity, "predicted": predicted, "current": current,
-            "confidence": confidence, "timestamp": now.strftime("%H:%M:%S"),
+            "severity": severity,
+            "predicted": predicted,
+            "current": current,
+            "confidence": confidence,
+            "timestamp": now.strftime("%H:%M:%S"),
             "causes": get_top_causes(predicted, current),
-            "actions": get_suggested_actions(severity)
+            "actions": get_suggested_actions(severity, predicted, current)
         }
+
         st.session_state.alerts.insert(0, alert)
         st.session_state.alerts = st.session_state.alerts[:10]
-        st.session_state.last_alert_time = now
         st.session_state.alert_count += 1
+        st.session_state.last_alert_time = now
+
         if slack_webhook:
-            _send_slack(alert, slack_webhook)
-        return alert
-    return None
+            send_rich_slack_alert(alert, slack_webhook)
+
+    return alert
 
 
 def get_top_causes(predicted, current):
@@ -273,33 +371,47 @@ def get_top_causes(predicted, current):
     return causes[:3]
 
 
-def get_suggested_actions(severity):
+def get_suggested_actions(severity, predicted=None, current=None):
+    actions = []
+
+    # Base actions
     if severity == "HIGH":
-        return ["Scale instance immediately", "Restart high-CPU services"]
+        actions += [
+            "Scale instance immediately",
+            "Restart high-CPU services"
+        ]
     elif severity == "MEDIUM":
-        return ["Monitor slowly", "Pre-warm standby instance"]
-    return ["No immediate action needed"]
+        actions += [
+            "Monitor workload closely",
+            "Pre-warm standby instance"
+        ]
+    else:
+        actions += [
+            "No immediate action needed"
+        ]
 
+    # Context-aware logic (THIS IS THE UPGRADE)
+    if predicted is not None and current is not None:
+        delta = predicted - current
 
-def _send_slack(alert, webhook_url):
-    try:
-        emoji = "🔴" if alert["severity"] == "HIGH" else "🟡" if alert["severity"] == "MEDIUM" else "🟢"
-        causes_text = "\n".join([f"• {c}" for c in alert["causes"]])
-        actions_text = "\n".join([f"• {a}" for a in alert["actions"]])
-        message = {"text": (
-            f"{emoji} *CrashGuard AI — CPU SPIKE PREDICTED*\n"
-            f"*Severity:* {alert['severity']}\n"
-            f"*Predicted CPU:* {alert['predicted']:.1%}\n"
-            f"*Current CPU:* {alert['current']:.1%}\n"
-            f"*Confidence:* {alert['confidence']:.2f}\n"
-            f"*Time:* {alert['timestamp']}\n"
-            f"*Causes:*\n{causes_text}\n"
-            f"*Actions:*\n{actions_text}"
-        )}
-        requests.post(webhook_url, json=message, timeout=5)
-    except Exception:
-        pass
+        if delta > 0.5:
+            actions.append("Investigate sudden workload spike")
+        elif delta > 0.25:
+            actions.append("Check batch jobs or background processes")
+        else:
+            actions.append("Review system performance trends")
 
+    # Controlled variation
+    import random
+    extra = random.choice([
+        "Check memory and I/O bottlenecks",
+        "Inspect recent deployments",
+        "Review cron jobs",
+        "Enable temporary auto-scaling"
+    ])
+    actions.append(extra)
+
+    return actions
 
 def get_health_status(current, predicted):
     val = max(current, predicted) if predicted else current
@@ -310,7 +422,7 @@ def get_health_status(current, predicted):
     return "HEALTHY", "#22c55e", "🟢"
 
 
-# ── CACHED model loading — loads once, reused across all reruns ──
+# ── CACHED model loading ──
 @st.cache_resource
 def get_model():
     return load_model()
@@ -349,7 +461,7 @@ with st.sidebar:
     n_mc_samples = st.slider("MC Samples", 10, 50, 15)
     st.divider()
     st.markdown(f"**Model:** {'✅ Loaded' if model else '❌ Not loaded'}")
-    st.markdown(f"**Scaler:** {'✅ Loaded' if scaler_live else '❌ Not found'}")
+    st.markdown(f"**Scaler:** {'✅ Loaded' if scaler_live else '❌ Missing'}")
     st.markdown(f"**Features:** {N_FEATURES}")
     st.markdown(f"**Alerts fired:** {st.session_state.alert_count}")
     st.markdown(f"**Data points:** {len(st.session_state.cpu_history)}")
@@ -366,6 +478,15 @@ st.session_state.time_history.append(now)
 predicted_cpu, confidence, last_features = make_prediction(
     model, st.session_state.cpu_history, scaler_live, cpu_scaler_live, window_size, n_mc=n_mc_samples)
 
+
+# 🔥 FINAL DEMO MODE (FORCED DYNAMIC SPIKE)
+if demo_mode:
+    if predicted_cpu is not None:
+        predicted_cpu = 0.72 + np.random.uniform(0.0, 0.18)
+        predicted_cpu = min(predicted_cpu, 0.9)
+
+        confidence = 0.6 + np.random.uniform(0.0, 0.1)
+
 multistep_means, multistep_stds = multistep_predict(
     model, st.session_state.cpu_history, scaler_live, cpu_scaler_live, n_forecast, window_size)
 
@@ -376,8 +497,18 @@ else:
     confidence = 0.0
     last_features = None
 
-alert = check_and_fire_alert(predicted_cpu, confidence or 0.0, current_cpu,
-                              spike_thresh, slack_webhook or None, demo_mode)
+alert = None
+
+# ⛔ Do NOT fire alerts until we have enough history
+if len(st.session_state.cpu_history) >= window_size:
+    alert = check_and_fire_alert(
+        predicted_cpu,
+        confidence or 0.0,
+        current_cpu,
+        spike_thresh,
+        slack_webhook or None,
+        demo_mode
+    )
 
 status, status_color, status_emoji = get_health_status(current_cpu, predicted_cpu)
 conf_val = confidence or 0.0
@@ -389,7 +520,7 @@ for i, p in enumerate(multistep_means):
         time_to_spike = (i + 1) * 60
         break
 
-# ── Integrated Gradients — disabled on Railway to save memory ──
+# ── Integrated Gradients — disabled on Railway ──
 if model is not None and last_features is not None:
     if st.session_state.ig_values is None:
         if os.getenv("DEMO_ENV", "local") != "railway":

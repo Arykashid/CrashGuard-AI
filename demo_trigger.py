@@ -1,19 +1,39 @@
 import threading
 import time
+import multiprocessing
 
 def stress_cpu():
     while True:
-        x = sum(i * i for i in range(100000))
+        x = [i**2 + i**3 for i in range(1000000)]
 
-threads = []
-for _ in range(4):
-    t = threading.Thread(target=stress_cpu, daemon=True)
-    t.start()
-    threads.append(t)
+def main():
+    print("=" * 50)
+    print("  CrashGuard AI — Strong Demo Trigger")
+    print("=" * 50)
+    
+    # Use ALL cores
+    num_threads = multiprocessing.cpu_count()
+    print(f"  Starting stress on {num_threads} threads...")
+    
+    threads = []
+    for i in range(num_threads):
+        t = threading.Thread(target=stress_cpu, daemon=True)
+        t.start()
+        threads.append(t)
+        print(f"  ✅ Thread {i+1}/{num_threads} started")
+    
+    print("\n  🔥 Max CPU stress running!")
+    print("  Watch Current CPU on dashboard rise above 70%")
+    print("  Press Ctrl+C to stop\n")
+    
+    try:
+        elapsed = 0
+        while True:
+            time.sleep(5)
+            elapsed += 5
+            print(f"  ⏱️ Running {elapsed}s — check dashboard CPU %")
+    except KeyboardInterrupt:
+        print("\n  ✅ Stopped")
 
-print("✅ CPU stress running — press Ctrl+C to stop")
-try:
-    while True:
-        time.sleep(1)
-except KeyboardInterrupt:
-    print("Stopped")
+if __name__ == "__main__":
+    main()
