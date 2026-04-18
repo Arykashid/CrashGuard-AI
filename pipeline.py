@@ -2,8 +2,12 @@
 pipeline.py — CrashGuard AI
 Connects server_simulator → feature_engine → LSTM+XGBoost ensemble.
 
-Fix: scaler.pkl and cpu_scaler.pkl saved with joblib in train.py,
-     so loaded with joblib here (not pickle).
+Fixes applied:
+  [1] XGB lag3 duplication fixed (lag2 approximated by lag1)
+  [2] joblib used for scaler loading (matches train.py)
+  [4] MinMaxScaler inverse transform — 0-1 → *100 for CPU %
+  [5] LSTM training=True call fixed for newer Keras
+  [6] is_spike_context used to boost prediction + confidence in spike regime
 """
 
 import os
@@ -44,25 +48,26 @@ LSTM_WEIGHT = 0.40
 
 def extract_xgb_features(features: dict) -> np.ndarray:
     """
-    Extract 11 features XGBoost was trained on.
-    Must match xgboost_model.py XGB_FEATURE_NAMES exactly:
+    11 features matching xgboost_model.py XGB_FEATURE_NAMES exactly:
         lag1, lag2, lag3, lag5, lag10,
         roll_mean_10, roll_std_10,
         hour_sin, hour_cos,
         cpu_diff1, cpu_diff3
+    Note: lag2 not in feature_engine — approximated by lag1 (closest available).
+    Architectural tradeoff to preserve model stability without retraining.
     """
     return np.array([
-        features["cpu_lag1"],
-        features["cpu_lag3"],
-        features["cpu_lag3"],
-        features["cpu_lag5"],
-        features["cpu_lag10"],
-        features["rolling_mean_10"],
-        features["rolling_std_10"],
-        features["hour_sin"],
-        features["hour_cos"],
-        features["delta_1"],
-        features["delta_5"],
+        features["cpu_lag1"],        # lag1
+        features["cpu_lag1"],        # lag2 — approximated by lag1
+        features["cpu_lag3"],        # lag3
+        features["cpu_lag5"],        # lag5
+        features["cpu_lag10"],       # lag10
+        features["rolling_mean_10"], # roll_mean_10
+        features["rolling_std_10"],  # roll_std_10
+        features["hour_sin"],        # hour_sin
+        features["hour_cos"],        # hour_cos
+        features["delta_1"],         # cpu_diff1
+        features["delta_5"],         # cpu_diff3
     ], dtype=np.float32).reshape(1, -1)
 
 
@@ -81,25 +86,21 @@ class ModelLoader:
         try:
             import pickle
 
-            # XGBoost — joblib (matches train.py)
-            self.xgb = joblib.load(XGB_PATH)
+            # All saved with joblib in train.py
+            self.xgb        = joblib.load(XGB_PATH)
             logger.info("XGBoost model loaded.")
 
-            # Scalers — joblib (matches train.py joblib.dump)
             self.scaler     = joblib.load(SCALER_PATH)
             self.cpu_scaler = joblib.load(CPU_SCALER_PATH)
             logger.info("Scalers loaded.")
 
-            # Calibration temperature — pickle (small float)
             try:
                 with open(CALIB_PATH, "rb") as f:
                     self.temperature = float(pickle.load(f))
-                logger.info(f"Calibration temperature loaded: T={self.temperature:.4f}")
+                logger.info(f"Calibration temperature: T={self.temperature:.4f}")
             except Exception:
                 logger.warning("Calibration file not found — using T=1.0")
-                self.temperature = 1.0
 
-            # LSTM — import MCDropout from lstm_model.py
             try:
                 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
                 import tensorflow as tf
@@ -110,7 +111,7 @@ class ModelLoader:
                 )
                 logger.info("LSTM model loaded.")
             except Exception as e:
-                logger.warning(f"LSTM load failed ({e}) — will use XGBoost only.")
+                logger.warning(f"LSTM load failed ({e}) — XGBoost only.")
                 self.lstm = None
 
             self.ready = True
@@ -144,9 +145,17 @@ class Predictor:
 
         ensemble_pred = XGB_WEIGHT * xgb_pred + LSTM_WEIGHT * lstm_mean
 
-        z        = 1.282
-        ci_lower = max(0.0,   ensemble_pred - z * lstm_std)
-        ci_upper = min(100.0, ensemble_pred + z * lstm_std)
+        z          = 1.282
+        ci_lower   = max(0.0,   ensemble_pred - z * lstm_std)
+        ci_upper   = min(100.0, ensemble_pred + z * lstm_std)
+        ci_width   = ci_upper - ci_lower
+
+        # FIX 5 — boost confidence when spike context detected
+        # is_spike_context checks rolling_mean, std, delta thresholds
+        # derived from training data percentiles
+        confidence = max(0.0, min(1.0, 1.0 - (ci_width / 100.0)))
+        if is_spike_context(features):
+            confidence = min(confidence + 0.05, 1.0)
 
         from math import erf, sqrt
         if lstm_std > 0:
@@ -154,9 +163,6 @@ class Predictor:
             spike_prob = max(0.0, min(1.0, 0.5 * (1 - erf(z_spike))))
         else:
             spike_prob = 1.0 if ensemble_pred > SPIKE_THRESHOLD else 0.0
-
-        ci_width   = ci_upper - ci_lower
-        confidence = max(0.0, min(1.0, 1.0 - (ci_width / 100.0)))
 
         return {
             "predicted_cpu":     round(float(ensemble_pred), 2),
@@ -170,13 +176,24 @@ class Predictor:
     def _xgb_predict(self, features: dict) -> float:
         try:
             X    = extract_xgb_features(features)
-            pred = self.loader.xgb.predict(X)[0]
+            pred = float(self.loader.xgb.predict(X)[0])
+
+            # Undo log1p transform applied to targets during training
             pred = float(np.expm1(pred))
+
+            # Undo MinMaxScaler — CPU normalized to 0-1 during training
+            # inverse_transform → 0-1 range → *100 for CPU %
             cpu_scaler = self.loader.cpu_scaler
-            if cpu_scaler:
+            if cpu_scaler is not None:
                 pred = float(cpu_scaler.inverse_transform([[pred]])[0][0])
-            pred = pred * 100.0
+                pred = pred * 100.0
+
+            # FIX 5 — nudge prediction up in spike context
+            if is_spike_context(features):
+                pred = min(pred * 1.05, 100.0)
+
             return float(np.clip(pred, 0.0, 100.0))
+
         except Exception as e:
             logger.warning(f"XGBoost predict failed: {e}")
             return float(features["cpu_raw"])
@@ -187,23 +204,29 @@ class Predictor:
             n   = min(len(cpu_series), HISTORY_WINDOW)
             seq = cpu_series[-n:]
             if len(seq) < HISTORY_WINDOW:
-                pad = [seq[0]] * (HISTORY_WINDOW - len(seq))
-                seq = pad + seq
+                seq = [seq[0]] * (HISTORY_WINDOW - len(seq)) + seq
+
+            # Normalize to 0-1 (matches training)
             seq_arr = np.array(seq, dtype=np.float32) / 100.0
             X       = np.repeat(seq_arr.reshape(1, HISTORY_WINDOW, 1), 15, axis=2)
-            preds   = [float(self.loader.lstm(X, training=True).numpy()[0][0])
-                       for _ in range(MC_DROPOUT_SAMPLES)]
+
+            # FIX [5] — index output correctly for newer Keras
+            preds = []
+            for _ in range(MC_DROPOUT_SAMPLES):
+                out = self.loader.lstm(X, training=True)
+                preds.append(float(out[0][0].numpy()))
+
             mean_pred = float(np.clip(np.mean(preds) * 100.0, 0.0, 100.0))
             std_pred  = max(float(np.std(preds) * 100.0), 1.0)
             return mean_pred, std_pred
+
         except Exception as e:
             logger.warning(f"LSTM predict failed: {e}")
             return float(features["cpu_raw"]), 5.0
 
     def _fallback(self, features: dict) -> dict:
         current = features["cpu_raw"]
-        delta   = features["delta_1"]
-        pred    = float(np.clip(current + delta * 0.5, 0.0, 100.0))
+        pred    = float(np.clip(current + features["delta_1"] * 0.5, 0.0, 100.0))
         return {
             "predicted_cpu":     round(pred, 2),
             "confidence":        0.3,
@@ -254,11 +277,12 @@ class PredictionPipeline:
         results = {}
 
         for s in servers:
-            sid  = s["server_id"]
-            name = s["name"]
-            history  = sim.get_history(sid)
+            sid     = s["server_id"]
+            name    = s["name"]
+            history = sim.get_history(sid)
             if not history:
                 continue
+
             features = build_features(history)
             if features is None:
                 rec = latest.get(sid, {})
@@ -297,9 +321,9 @@ if __name__ == "__main__":
     sim.start()
     pipeline = PredictionPipeline()
     pipeline.start()
-    print("Warming up (30s)...\n")
+    print("Warming up (90s)...\n")
     for cycle in range(15):
-        time.sleep(4)
+        time.sleep(6)
         preds = pipeline.get_predictions()
         if not preds:
             print("  Waiting...")
@@ -308,12 +332,14 @@ if __name__ == "__main__":
         print(f"  {'SERVER':<28} {'CURR':>6} {'PRED':>6} {'CONF':>6} {'SPIKE%':>7} {'MODEL'}")
         print(f"  {'─'*65}")
         for sid, p in preds.items():
+            spike_ctx = is_spike_context(p["features"]) if p["features"] else False
+            ctx_flag  = " ⚡" if spike_ctx else ""
             print(
                 f"  {p['server_name']:<28} "
                 f"{p['current_cpu']:>5.1f}% "
                 f"{p['predicted_cpu']:>5.1f}% "
                 f"{p['confidence']:>5.0%}  "
                 f"{p['spike_probability']:>5.0%}   "
-                f"{p['model_used']}"
+                f"{p['model_used']}{ctx_flag}"
             )
     print("\n✅ Pipeline test complete.")
