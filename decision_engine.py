@@ -45,9 +45,12 @@ SCALE_CONF_THRESHOLD    = 0.70             # minimum confidence for SCALE
 MONITOR_CPU_THRESHOLD   = 0.68 * MAX_CPU   # 64.6%  — trigger MONITOR
 FLUCTUATING_STD         = 0.15 * MAX_CPU   # 14.25% — trigger RESTART
 SPIKE_WINDOW_SECONDS    = 600              # 10 minutes
-SPIKE_COUNT_THRESHOLD   = 3               # spikes in window → ESCALATE
+SPIKE_ESCALATE_COUNT    = 3               # spikes in window → ESCALATE
+SPIKE_ESCALATE_RATE     = 0.3             # minimum spike_rate for ESCALATE
+SPIKE_ESCALATE_CPU      = 80.0            # minimum current_cpu for ESCALATE
 SPIKE_CPU_THRESHOLD     = 0.80 * MAX_CPU   # 76%    — what counts as a spike
 ALERT_COOLDOWN_SECONDS  = 300             # 5 min cooldown per server
+PREDICTION_INTERVAL     = 2               # seconds between predictions (matches pipeline)
 
 # ─────────────────────────────────────────────
 # DECISION CONSTANTS
@@ -146,10 +149,12 @@ class DecisionEngine:
     """
 
     def __init__(self):
-        self._spike_tracker   = SpikeTracker()
+        self._spike_tracker    = SpikeTracker()
         self._cooldown_tracker = CooldownTracker()
-        self._lock            = threading.Lock()
+        self._lock             = threading.Lock()
         self._last_decisions: dict[str, dict] = {}
+        # Action feedback memory — per-server (cpu, decision) history
+        self._action_history: dict[str, deque] = {}
 
     def evaluate(self, predictions: dict[str, dict]) -> dict[str, dict]:
         """
@@ -194,40 +199,120 @@ class DecisionEngine:
         rolling_std   = features.get("rolling_std_10", 0.0)
         rolling_mean  = features.get("rolling_mean_10", 0.0)
 
+        # Strong prediction correction — prevent unrealistic drops
+        predicted_cpu = self._correct_prediction(current_cpu, predicted_cpu)
+
+        # Model self-awareness — track prediction gap
+        prediction_gap = abs(current_cpu - predicted_cpu)
+
+        # Extreme disagreement — degrade confidence when model is unreliable
+        if prediction_gap > 35:
+            confidence *= 0.5
+
+        # Derive trend from delta features
+        delta_1 = features.get("delta_1", 0.0)
+        delta_5 = features.get("delta_5", 0.0)
+        trend   = self._trend_label(delta_1, delta_5)
+
+        # Derive dynamic load state for explanations
+        load_state = self._load_state(current_cpu)
+
         # Track spike events
         if current_cpu > SPIKE_CPU_THRESHOLD:
             self._spike_tracker.record_spike(server_id)
 
         spike_count = self._spike_tracker.get_spike_count(server_id)
+        spike_rate  = spike_count / max(1, SPIKE_WINDOW_SECONDS // PREDICTION_INTERVAL) if spike_count > 0 else 0.0
+
+        # Model disagreement annotation for explainability
+        disagree_note = (f" Model disagreement: {prediction_gap:.1f}%."
+                         if prediction_gap > 5.0 else "")
+
+        # Action feedback memory — detect if previous SCALE failed
+        scale_failed = False
+        if server_id in self._action_history:
+            hist = self._action_history[server_id]
+            if len(hist) >= 1:
+                prev_cpu, prev_decision = hist[-1]
+                if prev_decision == "SCALE" and current_cpu >= prev_cpu:
+                    scale_failed = True
+
+        # ── Decision persistence — ESCALATE is sticky ──────────────
+        last = self._last_decisions.get(server_id)
+        if last and last.get("decision") == "ESCALATE":
+            if current_cpu >= 60 or spike_count >= 1:
+                decision = "ESCALATE"
+                reason   = (f"System remains in escalated state — instability not yet resolved "
+                            f"(CPU={current_cpu:.1f}% at {load_state}, "
+                            f"{spike_count} spike(s) active){disagree_note}")
+                action   = "Escalating to on-call engineer via PagerDuty"
+
+        # ── Hard reality override (highest priority) ─────────────
+        elif current_cpu >= 85:
+            decision = "SCALE"
+            reason   = (f"CPU {current_cpu:.1f}% at {load_state} — "
+                        f"hard override triggered (≥85%){disagree_note}")
+            action   = "Triggering auto-scaling — spinning up additional instances"
+
+        elif current_cpu >= 75 and trend in ("rising", "rapidly_rising"):
+            decision = "SCALE"
+            reason   = (f"CPU {current_cpu:.1f}% at {load_state} with {trend} trend — "
+                        f"preemptive scale triggered{disagree_note}")
+            action   = "Triggering auto-scaling — spinning up additional instances"
 
         # ── Decision logic (priority order) ───────────────────────
-        if spike_count >= SPIKE_COUNT_THRESHOLD:
+        elif (
+            (spike_count >= SPIKE_ESCALATE_COUNT and (current_cpu >= 80 or scale_failed))
+            or (current_cpu > 85 and spike_prob > 0.7)
+            or (prediction_gap > 40 and current_cpu > 75)
+        ):
             decision = "ESCALATE"
-            reason   = (f"{spike_count} spikes detected in last 10 min — "
-                        f"repeated instability requires human review")
+            fail_note = (" Previous scaling action failed to reduce CPU load —"
+                         " escalation required." if scale_failed else "")
+            reason   = (f"Multi-signal escalation triggered "
+                        f"(CPU={current_cpu:.1f}% at {load_state}, "
+                        f"spikes={spike_count}, risk={spike_prob:.0%}, "
+                        f"disagreement={prediction_gap:.1f}%) — "
+                        f"sustained instability beyond autonomous recovery capacity"
+                        f"{disagree_note}{fail_note}")
             action   = "Escalating to on-call engineer via PagerDuty"
 
         elif predicted_cpu > SCALE_CPU_THRESHOLD and confidence > SCALE_CONF_THRESHOLD:
             decision = "SCALE"
             reason   = (f"Predicted CPU {predicted_cpu:.1f}% exceeds threshold "
-                        f"{SCALE_CPU_THRESHOLD:.0f}% with {confidence:.0%} confidence")
+                        f"{SCALE_CPU_THRESHOLD:.0f}% with {confidence:.0%} confidence — "
+                        f"current {load_state}{disagree_note}")
             action   = "Triggering auto-scaling — spinning up additional instances"
 
         elif rolling_std > FLUCTUATING_STD:
             decision = "RESTART"
             reason   = (f"CPU volatility (std={rolling_std:.1f}%) exceeds "
-                        f"threshold {FLUCTUATING_STD:.0f}% — unstable process detected")
+                        f"threshold {FLUCTUATING_STD:.0f}% — unstable process detected "
+                        f"at {load_state}")
             action   = "Scheduling graceful service restart to clear instability"
+
+        elif prediction_gap > 40 and current_cpu > 70:
+            decision = "SCALE"
+            reason   = (f"CPU {current_cpu:.1f}% at {load_state} with extreme model "
+                        f"disagreement ({prediction_gap:.1f}%) — "
+                        f"high model disagreement detected, prediction reliability degraded{disagree_note}")
+            action   = "Triggering auto-scaling — conservative action under unreliable prediction"
 
         elif predicted_cpu > MONITOR_CPU_THRESHOLD:
             decision = "MONITOR"
             reason   = (f"Predicted CPU {predicted_cpu:.1f}% above monitoring "
-                        f"threshold {MONITOR_CPU_THRESHOLD:.0f}% — elevated load")
+                        f"threshold {MONITOR_CPU_THRESHOLD:.0f}% — {load_state}{disagree_note}")
+            action   = "Increasing monitoring frequency — watching for escalation"
+
+        elif current_cpu >= 60:
+            decision = "MONITOR"
+            reason   = (f"CPU {current_cpu:.1f}% at {load_state} — "
+                        f"proactive monitoring engaged{disagree_note}")
             action   = "Increasing monitoring frequency — watching for escalation"
 
         else:
             decision = "STABLE"
-            reason   = (f"CPU {current_cpu:.1f}% within normal range — "
+            reason   = (f"CPU {current_cpu:.1f}% at {load_state} — "
                         f"predicted {predicted_cpu:.1f}% with {confidence:.0%} confidence")
             action   = "No action required — system operating normally"
 
@@ -243,6 +328,11 @@ class DecisionEngine:
 
         cooldown_remaining = self._cooldown_tracker.seconds_until_next(server_id)
 
+        # Record action feedback memory
+        if server_id not in self._action_history:
+            self._action_history[server_id] = deque(maxlen=3)
+        self._action_history[server_id].append((current_cpu, decision))
+
         return {
             "server_id":           server_id,
             "server_name":         server_name,
@@ -250,12 +340,14 @@ class DecisionEngine:
             "predicted_cpu":       round(predicted_cpu, 2),
             "confidence":          round(confidence,    4),
             "spike_probability":   round(spike_prob,    4),
+            "prediction_gap":      round(prediction_gap, 2),
             "decision":            decision,
             "severity":            severity,
             "color":               color,
             "reason":              reason,
             "action":              action,
             "spike_count":         spike_count,
+            "scale_failed":        scale_failed,
             "rolling_std":         round(rolling_std,   2),
             "rolling_mean":        round(rolling_mean,  2),
             "alert_ready":         alert_ready,
@@ -263,6 +355,35 @@ class DecisionEngine:
             "model_used":          model_used,
             "timestamp":           ts,
         }
+
+    @staticmethod
+    def _correct_prediction(current_cpu: float, raw_prediction: float) -> float:
+        """Prevent unrealistic prediction drops when CPU is high."""
+        if current_cpu >= 80 and raw_prediction < current_cpu - 15:
+            return current_cpu - 10
+        return raw_prediction
+
+    @staticmethod
+    def _trend_label(delta_1: float, delta_5: float) -> str:
+        """Derive trend label from delta features."""
+        if delta_1 > 3.0 and delta_5 > 5.0:
+            return "rapidly_rising"
+        elif delta_1 > 1.0:
+            return "rising"
+        elif delta_1 < -3.0 and delta_5 < -5.0:
+            return "rapidly_falling"
+        elif delta_1 < -1.0:
+            return "falling"
+        return "stable"
+
+    @staticmethod
+    def _load_state(current_cpu: float) -> str:
+        """Dynamic load state for accurate explanations."""
+        if current_cpu >= 80:
+            return "critical load"
+        elif current_cpu >= 65:
+            return "elevated load"
+        return "normal load"
 
     def _warming_up_record(self, pred: dict, ts: str) -> dict:
         return {
