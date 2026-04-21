@@ -43,7 +43,7 @@ logger = logging.getLogger("crashguard.app")
 # ─────────────────────────────────────────────
 # FLASK APP
 # ─────────────────────────────────────────────
-app = Flask(__name__, static_folder="assets", template_folder=".")
+app = Flask(__name__, static_folder="assets", static_url_path="/static", template_folder=".")
 
 # ─────────────────────────────────────────────
 # GLOBAL COMPONENTS
@@ -242,6 +242,15 @@ def api_demo_trigger():
     except Exception as e:
         logger.error(f"/api/demo/trigger error: {e}")
         return jsonify({"error": str(e), "status": "error"}), 500
+
+
+@app.route("/api/metrics")
+def api_metrics():
+    """Returns decision evaluation metrics."""
+    try:
+        return jsonify(engine.get_eval_metrics())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/health")

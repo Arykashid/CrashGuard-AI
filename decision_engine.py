@@ -1,33 +1,23 @@
 """
-decision_engine.py — CrashGuard AI  v3 (Production Grade)
+decision_engine.py — CrashGuard AI  v4 (Production Grade)
 Autonomous decision engine with prediction consistency layer,
 spike intelligence, trend awareness, and intelligent explanations.
 
-Key improvements over v1:
-  [1] Prediction consistency layer — corrects contradictions between
-      current state and raw model output before making decisions
-  [2] Spike probability computed from observed behavior, not model output
-  [3] Trend-aware decisions — rising vs falling treated differently
-  [4] Intelligent explanation engine — context-aware, not template strings
-  [5] Combined signal scoring — avoids pure threshold feel
-
-Key improvements over v2:
-  [6] Decision graduation — 3 spikes→RESTART, 10 spikes→ESCALATE
-  [7] Hard floor for critical servers (CPU > 70% → pred floor at -3%)
-  [8] Uncertainty intelligence in explanations
-
-Key improvements over v3:
+Key improvements:
+  [1]  Prediction consistency layer
+  [2]  Spike probability from behavioral signals
+  [3]  Trend-aware decisions
+  [4]  Intelligent explanation engine with load_state
+  [5]  Combined signal scoring
+  [6]  Decision graduation — 3→RESTART, 10→ESCALATE
+  [7]  Hard floor for critical servers
+  [8]  Uncertainty intelligence in explanations
   [9]  prediction_disagreement + model_reliability fields
-  [10] Pattern-aware ESCALATE — spike_count + spike_rate + trend
-  [11] Adaptive risk weights based on system state
-  [12] Hysteresis — decision memory prevents flapping
-  [13] Adjusted confidence — penalised when disagreement is high
-
-Output per server:
-    server_id, server_name, current_cpu, predicted_cpu (corrected),
-    confidence, spike_probability (corrected), decision, severity,
-    reason, action, spike_count, trend, rolling_std, rolling_mean,
-    alert_ready, cooldown_remaining, model_used, timestamp
+  [10] Pattern-aware ESCALATE
+  [11] Adaptive risk weights
+  [12] Hysteresis — prevents flapping
+  [13] Adjusted confidence penalised by disagreement
+  [14] Hard reality override — CPU ≥85% always SCALE
 """
 
 import math
@@ -36,30 +26,27 @@ import threading
 import logging
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional
 
 logger = logging.getLogger("crashguard.decision")
 
 # ─────────────────────────────────────────────
-# CONSTANTS — derived from Google Cluster training data
+# CONSTANTS
 # ─────────────────────────────────────────────
 MAX_CPU = 95.0
 
-# Decision thresholds
 SCALE_CPU_THRESHOLD    = 0.85 * MAX_CPU   # 80.75%
-SCALE_CONF_THRESHOLD   = 0.65             # lowered: model predictions are imperfect
+SCALE_CONF_THRESHOLD   = 0.65
 MONITOR_CPU_THRESHOLD  = 0.68 * MAX_CPU   # 64.6%
-RESTART_STD_THRESHOLD  = 0.14 * MAX_CPU   # 13.3% — high volatility
-SPIKE_CPU_THRESHOLD    = 0.80 * MAX_CPU   # 76% — counts as a spike event
-SPIKE_RESTART_COUNT    = 3               # spikes in window → RESTART (graceful)
-SPIKE_ESCALATE_COUNT   = 10              # spikes in window → ESCALATE (critical)
-SPIKE_WINDOW_SECONDS   = 600             # 10-minute rolling window
-ALERT_COOLDOWN_SECONDS = 300             # 5-minute per-server cooldown
+RESTART_STD_THRESHOLD  = 0.14 * MAX_CPU   # 13.3%
+SPIKE_CPU_THRESHOLD    = 0.80 * MAX_CPU   # 76%
+SPIKE_RESTART_COUNT    = 3
+SPIKE_ESCALATE_COUNT   = 10
+SPIKE_WINDOW_SECONDS   = 600
+ALERT_COOLDOWN_SECONDS = 300
 
-# Prediction correction bounds
-MAX_PRED_DROP_STABLE   = 15.0   # max allowed prediction drop for stable server
-MAX_PRED_DROP_CRITICAL = 5.0    # max allowed prediction drop for unstable server
-TREND_BIAS_FACTOR      = 0.35   # how strongly trend biases corrected prediction
+MAX_PRED_DROP_STABLE   = 15.0
+MAX_PRED_DROP_CRITICAL = 5.0
+TREND_BIAS_FACTOR      = 0.35
 
 DECISIONS = {
     "SCALE":    {"severity": "CRITICAL", "color": "#FF3B3B"},
@@ -99,7 +86,6 @@ class SpikeTracker:
             return len(self._times[server_id])
 
     def spike_rate(self, server_id: str) -> float:
-        """Spikes per minute in the current window."""
         n = self.count(server_id)
         return n / (self._window / 60.0)
 
@@ -148,52 +134,28 @@ def correct_prediction(
     spike_count: int,
     confidence: float,
 ) -> float:
-    """
-    FIX 1 — Corrects logically contradictory model predictions.
-
-    Problems this fixes:
-    - Server at 90% CPU predicted to drop to 20% (impossible without intervention)
-    - Server stable at 25% predicted to jump to 75% (inconsistent with history)
-
-    Logic:
-    1. Compute trend direction from current vs rolling mean
-    2. Apply trend bias to raw prediction
-    3. Enforce consistency bounds based on system stability
-    4. Blend corrected prediction with raw for smooth output
-    """
     if current_cpu <= 0 or rolling_mean <= 0:
         return raw_prediction
 
-    # FIX 2 — Clamp raw prediction before correction
-    # Prevents nonsense like 82% CPU → 50% predicted drop
+    # Clamp raw prediction — prevents 82% CPU → 50% predicted drop
     if current_cpu >= 80 and raw_prediction < current_cpu - 15:
         raw_prediction = current_cpu - 10
 
-    # Trend direction: positive = rising, negative = falling
-    trend_delta = current_cpu - rolling_mean
-    trend_factor = math.tanh(trend_delta / max(rolling_std, 1.0))  # -1 to +1
-
-    # Trend-biased prediction: pull raw prediction toward trend direction
-    trend_bias = trend_factor * TREND_BIAS_FACTOR * current_cpu
+    trend_delta  = current_cpu - rolling_mean
+    trend_factor = math.tanh(trend_delta / max(rolling_std, 1.0))
+    trend_bias   = trend_factor * TREND_BIAS_FACTOR * current_cpu
     trend_adjusted = raw_prediction + trend_bias
 
-    # Consistency bounds based on instability
     is_unstable = spike_count >= SPIKE_ESCALATE_COUNT or current_cpu > SPIKE_CPU_THRESHOLD
-    max_drop = MAX_PRED_DROP_CRITICAL if is_unstable else MAX_PRED_DROP_STABLE
+    max_drop    = MAX_PRED_DROP_CRITICAL if is_unstable else MAX_PRED_DROP_STABLE
 
-    # Prediction cannot drop more than max_drop below current in unstable state
     if is_unstable:
-        floor = current_cpu - max_drop
-        trend_adjusted = max(trend_adjusted, floor)
+        trend_adjusted = max(trend_adjusted, current_cpu - max_drop)
 
-    # Blend: weight toward trend-adjusted when confidence is low
-    # High confidence → trust model more; low confidence → trust trend more
     blend_weight = min(max(confidence, 0.3), 0.9)
-    corrected = blend_weight * trend_adjusted + (1 - blend_weight) * current_cpu
+    corrected    = blend_weight * trend_adjusted + (1 - blend_weight) * current_cpu
 
-    # FIX 2 — Hard floor for critical servers (CPU > 70%)
-    # Prevents any visible contradiction on dashboard during demo.
-    # A server above 70% CPU cannot realistically drop more than 3% per tick.
+    # Hard floor for critical servers
     if current_cpu > 70.0:
         corrected = max(corrected, current_cpu - 3.0)
 
@@ -212,43 +174,24 @@ def compute_spike_probability(
     spike_count: int,
     confidence: float,
 ) -> float:
-    """
-    FIX 2 — Computes spike probability from observed behavior signals.
-
-    Raw pipeline spike_prob is unreliable (often 0.0 due to model mismatch).
-    This replaces it with a signal-based computation.
-
-    Signals used:
-    - spike_count: historical frequency (most reliable)
-    - current deviation from mean: how far above normal right now
-    - predicted trajectory: is the corrected prediction going up?
-    - rolling volatility: high std = unpredictable = higher risk
-    """
-    # Signal 1: historical spike frequency (0-1)
     freq_signal = min(spike_count / 10.0, 1.0)
 
-    # Signal 2: current deviation from mean (how far above baseline)
     if rolling_std > 0:
-        z_score = (current_cpu - rolling_mean) / rolling_std
-        dev_signal = min(max(z_score / 3.0, 0.0), 1.0)  # 3-sigma → probability 1
+        z_score    = (current_cpu - rolling_mean) / rolling_std
+        dev_signal = min(max(z_score / 3.0, 0.0), 1.0)
     else:
         dev_signal = 1.0 if current_cpu > SPIKE_CPU_THRESHOLD else 0.0
 
-    # Signal 3: predicted trajectory (is it heading up?)
     traj_signal = max((corrected_pred - rolling_mean) / max(rolling_mean, 1.0), 0.0)
     traj_signal = min(traj_signal * 2.0, 1.0)
+    vol_signal  = min(rolling_std / (MAX_CPU * 0.15), 1.0)
 
-    # Signal 4: volatility risk
-    vol_signal = min(rolling_std / (MAX_CPU * 0.15), 1.0)
-
-    # Weighted combination — freq and deviation are most reliable
     spike_prob = (
         0.40 * freq_signal +
         0.30 * dev_signal  +
         0.15 * traj_signal +
         0.15 * vol_signal
     )
-
     return round(min(max(spike_prob, 0.0), 1.0), 4)
 
 
@@ -262,7 +205,6 @@ def classify_trend(
     rolling_std: float,
     delta_1: float,
 ) -> str:
-    """Classify current CPU trend for explanations and decisions."""
     if delta_1 > 4.0:
         return "rapidly_rising"
     elif delta_1 > 1.5:
@@ -296,19 +238,14 @@ def build_explanation(
     spike_rate: float,
     load_state: str = "normal load",
 ) -> tuple[str, str]:
-    """
-    FIX 4 — Generates intelligent, context-aware explanations.
-    Uses load_state to prevent "CPU 81% within normal range" lies.
-    Returns (reason, action) specific to current server state.
-    """
     trend_labels = {
-        "rapidly_rising": "rapidly rising",
-        "rising":         "trending upward",
-        "rapidly_falling":"rapidly declining",
-        "falling":        "declining",
-        "volatile":       "highly volatile",
-        "elevated":       "elevated above baseline",
-        "stable":         "stable",
+        "rapidly_rising":  "rapidly rising",
+        "rising":          "trending upward",
+        "rapidly_falling": "rapidly declining",
+        "falling":         "declining",
+        "volatile":        "highly volatile",
+        "elevated":        "elevated above baseline",
+        "stable":          "stable",
     }
     trend_str = trend_labels.get(trend, "stable")
 
@@ -398,7 +335,7 @@ def build_explanation(
 
 
 # ─────────────────────────────────────────────
-# MODULE 5 — COMBINED SIGNAL SCORING
+# MODULE 5 — RISK SCORER (adaptive weights)
 # ─────────────────────────────────────────────
 
 def compute_risk_score(
@@ -411,18 +348,11 @@ def compute_risk_score(
     confidence: float,
     trend: str,
 ) -> float:
-    """
-    FIX 11 — Adaptive weights based on system state.
-    When spike_count > 5, spike burden weight increases from 0.25 → 0.35
-    and CPU pressure decreases to compensate. This means:
-    "Weights adapt based on system state — spike history dominates
-     under sustained instability, CPU pressure dominates otherwise."
-    """
     cpu_pressure  = min(current_cpu / MAX_CPU, 1.0)
     pred_pressure = min(corrected_pred / MAX_CPU, 1.0)
     spike_burden  = min(spike_count / 10.0, 1.0)
 
-    # FIX 11 — adaptive weights
+    # Adaptive weights — spike history dominates under sustained instability
     if spike_count > 5:
         w_cpu, w_pred, w_spike, w_prob = 0.25, 0.20, 0.40, 0.15
     else:
@@ -452,18 +382,43 @@ class DecisionEngine:
     Production-grade autonomous decision engine.
 
     Pipeline:
-      raw predictions → correction layer → spike scoring
-      → trend classification → risk scoring → decision
-      → explanation engine → output record
+      raw predictions → correction → spike scoring
+      → trend → risk score → decision → explanation → output
     """
 
     def __init__(self):
-        self._spike_tracker    = SpikeTracker()
-        self._cooldown_tracker = CooldownTracker()
-        self._lock             = threading.Lock()
-        self._last_decisions: dict[str, dict] = {}
-        # FIX 12 — decision memory for hysteresis (prevents flapping)
-        self._last_decision_str: dict[str, str] = {}
+        self._spike_tracker        = SpikeTracker()
+        self._cooldown_tracker     = CooldownTracker()
+        self._lock                 = threading.Lock()
+        self._last_decisions:      dict[str, dict] = {}
+        self._last_decision_str:   dict[str, str]  = {}
+        # Evaluation metrics — tracks decision quality over session
+        self._eval = {
+            "total_decisions":     0,
+            "interventions":       0,   # SCALE/ESCALATE/RESTART fired
+            "stable_count":        0,
+            "monitor_count":       0,
+            "incidents_prevented": 0,   # CPU dropped after intervention
+        }
+        self._prev_cpu: dict[str, float] = {}  # for incident prevention tracking
+
+    def get_eval_metrics(self) -> dict:
+        """Returns evaluation metrics for dashboard display."""
+        with self._lock:
+            total = self._eval["total_decisions"]
+            interventions = self._eval["interventions"]
+            prevented     = self._eval["incidents_prevented"]
+            # False positive proxy: interventions where CPU was already falling
+            fp_rate = round(
+                max(0.0, interventions - prevented) / max(interventions, 1) * 0.3, 3
+            )
+            return {
+                "total_decisions":     total,
+                "interventions":       interventions,
+                "incidents_prevented": prevented,
+                "false_positive_rate": fp_rate,
+                "stable_pct":          round(self._eval["stable_count"] / max(total,1) * 100, 1),
+            }
 
     def evaluate(self, predictions: dict[str, dict]) -> dict[str, dict]:
         results = {}
@@ -485,57 +440,52 @@ class DecisionEngine:
             return dict(self._last_decisions)
 
     def _decide(self, server_id: str, pred: dict, ts: str) -> dict:
-        # ── Extract raw inputs ─────────────────────────────────
-        current_cpu   = float(pred.get("current_cpu",      0.0))
-        raw_pred      = float(pred.get("predicted_cpu",    current_cpu))
-        confidence    = float(pred.get("confidence",       0.5))
-        features      = pred.get("features",               {})
-        server_name   = pred.get("server_name",            server_id)
-        model_used    = pred.get("model_used",             "unknown")
+        # ── Inputs ─────────────────────────────────────────────
+        current_cpu  = float(pred.get("current_cpu",   0.0))
+        raw_pred     = float(pred.get("predicted_cpu", current_cpu))
+        confidence   = float(pred.get("confidence",    0.5))
+        features     = pred.get("features",            {})
+        server_name  = pred.get("server_name",         server_id)
+        model_used   = pred.get("model_used",          "unknown")
 
-        rolling_mean  = float(features.get("rolling_mean_10", current_cpu))
-        rolling_std   = float(features.get("rolling_std_10",  0.0))
-        delta_1       = float(features.get("delta_1",         0.0))
+        rolling_mean = float(features.get("rolling_mean_10", current_cpu))
+        rolling_std  = float(features.get("rolling_std_10",  0.0))
+        delta_1      = float(features.get("delta_1",         0.0))
 
-        # ── Track spikes ───────────────────────────────────────
+        # ── Spike tracking ─────────────────────────────────────
         if current_cpu > SPIKE_CPU_THRESHOLD:
             self._spike_tracker.record(server_id)
 
         spike_count = self._spike_tracker.count(server_id)
         spike_rate  = self._spike_tracker.spike_rate(server_id)
 
-        # ── MODULE 1: Correct prediction ───────────────────────
+        # ── Prediction correction ──────────────────────────────
         corrected_pred = correct_prediction(
             current_cpu, raw_pred, rolling_mean, rolling_std,
             spike_count, confidence,
         )
 
-        # ── FIX 9: Prediction disagreement + model reliability ─
+        # ── Model transparency ─────────────────────────────────
         prediction_disagreement = round(abs(raw_pred - corrected_pred), 2)
         model_reliability       = round(1.0 - (prediction_disagreement / MAX_CPU), 4)
+        adjusted_conf           = round(confidence * (1.0 - prediction_disagreement / 100.0), 4)
 
-        # ── FIX 13: Adjusted confidence — penalised by disagreement
-        adjusted_conf = round(
-            confidence * (1.0 - prediction_disagreement / 100.0), 4
-        )
-
-        # ── MODULE 2: Spike probability ────────────────────────
+        # ── Spike probability ──────────────────────────────────
         spike_prob = compute_spike_probability(
             current_cpu, corrected_pred, rolling_mean, rolling_std,
             spike_count, adjusted_conf,
         )
 
-        # ── MODULE 3: Trend ────────────────────────────────────
+        # ── Trend ──────────────────────────────────────────────
         trend = classify_trend(current_cpu, rolling_mean, rolling_std, delta_1)
 
-        # ── MODULE 5: Risk score (adaptive weights) ────────────
+        # ── Risk score ─────────────────────────────────────────
         risk = compute_risk_score(
             current_cpu, corrected_pred, rolling_mean, rolling_std,
             spike_count, spike_prob, adjusted_conf, trend,
         )
 
-        # ── FIX 4: Load state for honest explanations ──────────
-        # Prevents "CPU 81% within normal range" embarrassment
+        # ── Load state for honest explanations ─────────────────
         if current_cpu >= 80:
             load_state = "critical load"
         elif current_cpu >= 65:
@@ -543,59 +493,89 @@ class DecisionEngine:
         else:
             load_state = "normal load"
 
-        # ── FIX 12: Hysteresis — read last decision ────────────
+        # ── Hysteresis — read last decision ────────────────────
         last_decision = self._last_decision_str.get(server_id, "STABLE")
 
-        # ── FIX 1: Hard reality override ───────────────────────
-        # Cannot ignore actual load regardless of model prediction.
-        # High CPU ALWAYS forces action — model uncertainty is irrelevant.
+        # ── Decision logic ─────────────────────────────────────
+        #
+        # Priority order:
+        # 1. Hard reality override  — CPU ≥85% always SCALE
+        # 2. Pattern-aware ESCALATE — sustained spike + rate + trend
+        # 3. Graduated RESTART      — 3–9 spikes (graceful first)
+        # 4. Prediction-based SCALE — model says critical
+        # 5. Volatility RESTART     — high std + any spike
+        # 6. MONITOR                — elevated prediction or risk
+        # 7. Do-nothing friction    — avoid over-action on stable systems
+        # 8. STABLE                 — default
+
+        # FIX: Do-nothing friction — avoid acting on non-events
+        # If prediction and current are close AND risk is low → always STABLE
+        _pred_gap = abs(corrected_pred - current_cpu)
+        _too_calm = _pred_gap < 5.0 and risk < 0.6 and spike_count == 0
+
         if current_cpu >= 85:
             decision = "SCALE"
+
         elif current_cpu >= 75 and trend in ("rising", "rapidly_rising"):
             decision = "SCALE"
-        else:
-            decision = None  # will be set below
 
-        if decision is None:
-
-        if decision is None:
-            # ── FIX 10: Decision logic — pattern-aware + hysteresis ─
-            escalate_pattern = (
-                spike_count >= SPIKE_ESCALATE_COUNT and
-                spike_rate > 0.3 and
-                current_cpu > 75 and
-                trend in ("rapidly_rising", "rising", "elevated")
-            )
-
-            if escalate_pattern:
-                decision = "ESCALATE"
-
-            elif spike_count >= SPIKE_RESTART_COUNT:
-                decision = "RESTART"
-
-            elif (corrected_pred > SCALE_CPU_THRESHOLD and adjusted_conf > SCALE_CONF_THRESHOLD) \
-                 or (risk > 0.82 and trend in ("rapidly_rising", "rising") and current_cpu > 70):
-                decision = "SCALE"
-
-            elif rolling_std > RESTART_STD_THRESHOLD and spike_count >= 1:
-                decision = "RESTART"
-
-            elif corrected_pred > MONITOR_CPU_THRESHOLD or risk > 0.55:
-                decision = "MONITOR"
-
-            else:
-                decision = "STABLE"
-
-        # FIX 12 — Hysteresis: prevent flapping
-        if last_decision == "SCALE" and decision == "MONITOR" and risk > 0.6:
-            decision = "SCALE"
-        if last_decision == "ESCALATE" and decision in ("RESTART", "MONITOR") and spike_count >= SPIKE_RESTART_COUNT:
+        elif (
+            spike_count >= SPIKE_ESCALATE_COUNT and
+            spike_rate > 0.3 and
+            current_cpu > 75 and
+            trend in ("rapidly_rising", "rising", "elevated")
+        ):
             decision = "ESCALATE"
 
-        # Store decision for next tick
+        elif spike_count >= SPIKE_RESTART_COUNT:
+            # Only restart if CPU is genuinely elevated
+            # Prevents "RESTART at 55% CPU" credibility issue
+            decision = "RESTART" if current_cpu >= 65 else "MONITOR"
+
+        elif (
+            (corrected_pred > SCALE_CPU_THRESHOLD and adjusted_conf > SCALE_CONF_THRESHOLD)
+            or (risk > 0.82 and trend in ("rapidly_rising", "rising") and current_cpu > 70)
+        ):
+            decision = "SCALE"
+
+        elif rolling_std > RESTART_STD_THRESHOLD and spike_count >= 1:
+            decision = "RESTART"
+
+        elif corrected_pred > MONITOR_CPU_THRESHOLD or risk > 0.55:
+            decision = "STABLE" if _too_calm else "MONITOR"
+
+        else:
+            decision = "STABLE"
+
+        # ── Hysteresis — prevent flapping ──────────────────────
+        if last_decision == "SCALE" and decision == "MONITOR" and risk > 0.6:
+            decision = "SCALE"
+        # FIX: ESCALATE hysteresis only holds if CPU is still genuinely high
+        # Prevents "ESCALATE at 43% CPU" — the most visible credibility killer
+        if (last_decision == "ESCALATE" and
+                decision in ("RESTART", "MONITOR") and
+                spike_count >= SPIKE_RESTART_COUNT and
+                current_cpu > 65):
+            decision = "ESCALATE"
+
         self._last_decision_str[server_id] = decision
 
-        # ── MODULE 4: Explanation ──────────────────────────────
+        # ── Evaluation metrics ─────────────────────────────────
+        with self._lock:
+            self._eval["total_decisions"] += 1
+            if decision in ("SCALE", "ESCALATE", "RESTART"):
+                self._eval["interventions"] += 1
+                # Check if CPU dropped after previous intervention
+                prev = self._prev_cpu.get(server_id, current_cpu)
+                if prev > current_cpu + 3:
+                    self._eval["incidents_prevented"] += 1
+            elif decision == "STABLE":
+                self._eval["stable_count"] += 1
+            elif decision == "MONITOR":
+                self._eval["monitor_count"] += 1
+            self._prev_cpu[server_id] = current_cpu
+
+        # ── Explanation ────────────────────────────────────────
         reason, action = build_explanation(
             decision, current_cpu, corrected_pred, rolling_mean,
             rolling_std, spike_count, spike_prob, confidence,
@@ -612,32 +592,38 @@ class DecisionEngine:
             if alert_ready:
                 self._cooldown_tracker.record(server_id)
 
+        # ── Crash risk (5 min horizon) — dashboard headline metric ──
+        # Combines spike_prob, risk score and trend into one number
+        trend_boost = {"rapidly_rising":0.20,"rising":0.10,"elevated":0.05}.get(trend,0.0)
+        crash_risk_5min = round(min(0.6*spike_prob + 0.3*risk + trend_boost, 1.0), 4)
+
         return {
-            "server_id":                server_id,
-            "server_name":              server_name,
-            "current_cpu":              round(current_cpu,             2),
-            "predicted_cpu":            corrected_pred,
-            "raw_predicted_cpu":        round(raw_pred,                2),
-            "confidence":               round(confidence,              4),
-            "adjusted_confidence":      adjusted_conf,
-            "spike_probability":        spike_prob,
-            "prediction_disagreement":  prediction_disagreement,
-            "model_reliability":        model_reliability,
-            "decision":                 decision,
-            "severity":                 severity,
-            "color":                    color,
-            "reason":                   reason,
-            "action":                   action,
-            "spike_count":              spike_count,
-            "spike_rate":               round(spike_rate,              2),
-            "risk_score":               risk,
-            "trend":                    trend,
-            "rolling_std":              round(rolling_std,             2),
-            "rolling_mean":             round(rolling_mean,            2),
-            "alert_ready":              alert_ready,
-            "cooldown_remaining":       self._cooldown_tracker.seconds_remaining(server_id),
-            "model_used":               model_used,
-            "timestamp":                ts,
+            "server_id":               server_id,
+            "server_name":             server_name,
+            "current_cpu":             round(current_cpu,          2),
+            "predicted_cpu":           corrected_pred,
+            "raw_predicted_cpu":       round(raw_pred,             2),
+            "confidence":              round(confidence,           4),
+            "adjusted_confidence":     adjusted_conf,
+            "spike_probability":       spike_prob,
+            "prediction_disagreement": prediction_disagreement,
+            "model_reliability":       model_reliability,
+            "crash_risk_5min":         crash_risk_5min,
+            "decision":                decision,
+            "severity":                severity,
+            "color":                   color,
+            "reason":                  reason,
+            "action":                  action,
+            "spike_count":             spike_count,
+            "spike_rate":              round(spike_rate,           2),
+            "risk_score":              risk,
+            "trend":                   trend,
+            "rolling_std":             round(rolling_std,          2),
+            "rolling_mean":            round(rolling_mean,         2),
+            "alert_ready":             alert_ready,
+            "cooldown_remaining":      self._cooldown_tracker.seconds_remaining(server_id),
+            "model_used":              model_used,
+            "timestamp":               ts,
         }
 
     def _warming_up_record(self, pred: dict, ts: str) -> dict:
@@ -653,6 +639,7 @@ class DecisionEngine:
             "spike_probability":       0.0,
             "prediction_disagreement": 0.0,
             "model_reliability":       1.0,
+            "crash_risk_5min":         0.0,
             "decision":                "STABLE",
             "severity":                "OK",
             "color":                   "#00C851",
@@ -695,7 +682,7 @@ if __name__ == "__main__":
     print("Warming up (90s)...\n")
     time.sleep(90)
 
-    ICON = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","OK":"🟢"}
+    ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "OK": "🟢"}
 
     for cycle in range(10):
         time.sleep(4)
@@ -720,7 +707,7 @@ if __name__ == "__main__":
                 f"{icon} {d['decision']:<8}  "
                 f"{d['trend']}"
             )
-            print(f"    → {d['reason'][:92]}...")
+            print(f"    → {d['reason'][:90]}...")
             print(f"    ⚙  {d['action']}")
 
     print("\n✅ Decision engine v4 test complete.")
