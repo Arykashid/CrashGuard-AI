@@ -44,12 +44,21 @@ function navigateTo(page) {
     <span style="color:var(--text3)"> / </span>
     <span style="color:var(--text);font-weight:600">${labels[page] || page}</span>`;
 
-  // Show/hide pages — Fix 2: use block not flex (more reliable)
+  // Show/hide pages — explicit dimensions to guarantee visibility
   document.querySelectorAll('.page').forEach(el => {
     el.style.display = 'none';
   });
   const activePage = document.getElementById('page-' + page);
-  if (activePage) activePage.style.display = 'block';
+  if (activePage) {
+    activePage.style.display = 'block';
+    activePage.style.flexDirection = 'column';
+    activePage.style.width = '100%';
+    activePage.style.height = 'calc(100vh - 46px)';
+    activePage.style.overflowY = 'auto';
+    activePage.style.padding = '14px 18px';
+    activePage.style.background = '#07090d';
+    activePage.style.gap = '12px';
+  }
 
   // Render page-specific content
   if (page === 'systems') renderSystemsPage();
@@ -185,9 +194,10 @@ function processData(data) {
   if (!S.selected && servers.length) selectServer(servers[0].server_id);
   else if (S.selected) updateChart(S.selected);
 
-  // Refresh current non-dashboard page if visible
+  // Always refresh current page content on every data tick
   if (S.currentPage === 'systems') renderSystemsPage();
   if (S.currentPage === 'alerts') renderAlertsPage();
+  if (S.currentPage === 'models') renderModelsPage();
   if (S.currentPage === 'predictions') renderPredictionsPage();
 }
 
@@ -436,15 +446,20 @@ function renderModelsPage() {
 // ── PREDICTIONS PAGE ───────────────────────────────────────────
 function renderPredictionsPage() {
   const el = document.getElementById('predictions-table-body');
-  // Fix 3 — visible error instead of silent failure
   if (!el) {
-    console.error('❌ predictions-table-body NOT FOUND in DOM');
+    console.error('❌ predictions-table-body NOT FOUND');
     return;
   }
-  // Fix 4 — hardened data access
-  const servers = Object.values(S.servers || {});
+
+  // Robust — works whether S.servers is dict or array
+  const servers = Array.isArray(S.servers)
+    ? S.servers
+    : Object.values(S.servers || {});
+
+  console.log('Predictions data:', servers.length, 'servers');
+
   if (servers.length === 0) {
-    el.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:20px">Warming up...</td></tr>';
+    el.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#475569;padding:20px">Warming up — waiting for data...</td></tr>';
     return;
   }
 
@@ -453,37 +468,48 @@ function renderPredictionsPage() {
     falling: '↘', rapidly_falling: '📉', volatile: '⚡', elevated: '↑'
   };
 
-  // Top risk server — simple text line
-  let topRisk = servers.reduce((a, s) => {
+  // Top risk line
+  const topRisk = servers.reduce((a, s) => {
     const cr = s.crash_risk_5min || s.spike_probability || 0;
-    const ac = a.crash_risk_5min || a.spike_probability || 0;
-    return cr > ac ? s : a;
+    const acr = a.crash_risk_5min || a.spike_probability || 0;
+    return cr > acr ? s : a;
   }, servers[0]);
   const topLine = document.getElementById('top-risk-line');
   if (topLine && topRisk && topRisk.model_used !== 'warming_up') {
     const cr = ((topRisk.crash_risk_5min || topRisk.spike_probability || 0) * 100).toFixed(0);
     topLine.textContent = topRisk.server_name + ' — ' + cr + '% crash risk';
-    topLine.style.color = cr > 60 ? 'var(--red)' : cr > 35 ? 'var(--orange)' : 'var(--yellow)';
+    topLine.style.color = cr > 60 ? '#ef4444' : cr > 35 ? '#f97316' : '#eab308';
   }
 
   el.innerHTML = servers.map(s => {
-    const diff = s.predicted_cpu - s.current_cpu;
-    const diffColor = diff > 5 ? '#ef4444' : diff < -5 ? '#22c55e' : '#94a3b8';
-    const conf = ((s.adjusted_confidence || s.confidence || 0) * 100).toFixed(0);
-    const cr = ((s.crash_risk_5min || s.spike_probability || 0) * 100).toFixed(0);
-    const ticon = TREND_ICON[s.trend || 'stable'] || '→';
-    const dc = DC[s.decision] || DC.STABLE;
-    const crColor = cr > 60 ? '#ef4444' : cr > 35 ? '#f97316' : '#22c55e';
     const w = s.model_used === 'warming_up';
-    return `<tr>
-      <td style="font-weight:600">${s.server_name}</td>
-      <td style="font-family:var(--mono);font-weight:700;color:${s.current_cpu > 80 ? '#ef4444' : s.current_cpu > 60 ? '#f97316' : '#3b82f6'}">${s.current_cpu.toFixed(1)}%</td>
-      <td style="font-family:var(--mono);font-weight:700;color:var(--orange)">${w ? '—' : s.predicted_cpu.toFixed(1) + '%'}</td>
-      <td style="font-family:var(--mono);color:${diffColor}">${w ? '—' : (diff > 0 ? '+' : '') + diff.toFixed(1) + '%'}</td>
-      <td style="font-family:var(--mono);color:var(--green)">${w ? '—' : conf + '%'}</td>
-      <td>${ticon} <span style="font-size:11px;color:var(--text3)">${s.trend || '—'}</span></td>
-      <td style="font-family:var(--mono);font-weight:700;color:${crColor}">${w ? '—' : cr + '%'}</td>
-      <td><span class="srv-badge" style="background:${dc.bg};color:${dc.color};border:1px solid ${dc.border}">${s.decision}</span></td>
+    const diff = (s.predicted_cpu || 0) - (s.current_cpu || 0);
+    const diffColor = diff > 5 ? '#ef4444' : diff < -5 ? '#22c55e' : '#94a3b8';
+    const conf = (((s.adjusted_confidence || s.confidence || 0)) * 100).toFixed(0);
+    const cr = (((s.crash_risk_5min || s.spike_probability || 0)) * 100).toFixed(0);
+    const ticon = TREND_ICON[s.trend || 'stable'] || '→';
+
+    console.log("Decision value:", s.decision);
+    console.log("DC exists:", typeof DC);
+
+    const dc = (typeof DC !== 'undefined' && DC[s.decision])
+      ? DC[s.decision]
+      : {
+        bg: 'rgba(34,197,94,0.10)',
+        color: '#22c55e',
+        border: 'rgba(34,197,94,0.35)'
+      };
+    const crColor = cr > 60 ? '#ef4444' : cr > 35 ? '#f97316' : '#22c55e';
+    const cpuColor = s.current_cpu > 80 ? '#ef4444' : s.current_cpu > 60 ? '#f97316' : '#3b82f6';
+    return `<tr style="border-bottom:1px solid rgba(255,255,255,0.06)">
+      <td style="padding:10px 12px;font-weight:600;color:#e2e8f0">${s.server_name || s.server_id}</td>
+      <td style="padding:10px 12px;font-family:monospace;font-weight:700;color:${cpuColor}">${(s.current_cpu || 0).toFixed(1)}%</td>
+      <td style="padding:10px 12px;font-family:monospace;font-weight:700;color:#f97316">${w ? '—' : (s.predicted_cpu || 0).toFixed(1) + '%'}</td>
+      <td style="padding:10px 12px;font-family:monospace;color:${diffColor}">${w ? '—' : (diff > 0 ? '+' : '') + diff.toFixed(1) + '%'}</td>
+      <td style="padding:10px 12px;font-family:monospace;color:#22c55e">${w ? '—' : conf + '%'}</td>
+      <td style="padding:10px 12px">${ticon} <span style="font-size:11px;color:#94a3b8">${s.trend || 'stable'}</span></td>
+      <td style="padding:10px 12px;font-family:monospace;font-weight:700;color:${crColor}">${w ? '—' : cr + '%'}</td>
+      <td style="padding:10px 12px"><span style="font-size:10px;font-weight:700;padding:3px 8px;border-radius:4px;background:${dc.bg};color:${dc.color};border:1px solid ${dc.border}">${s.decision}</span></td>
     </tr>`;
   }).join('');
 }

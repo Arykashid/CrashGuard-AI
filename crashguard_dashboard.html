@@ -20,6 +20,9 @@
       background: var(--bg);
       flex-direction: column;
       gap: 12px;
+      flex: 1;
+      min-height: 0;
+      width: 100%;
     }
 
     .page-table {
@@ -225,7 +228,7 @@
       </div>
 
       <!-- ══ PAGE: DASHBOARD ══ -->
-      <div id="page-dashboard" class="page" style="display:block">
+      <div id="page-dashboard" class="page" style="display:flex">
 
         <!-- HERO -->
         <div class="hero-banner" id="hero-banner"
@@ -339,7 +342,8 @@
       </div>
 
       <!-- ══ PAGE: SYSTEMS ══ -->
-      <div id="page-systems" class="page" style="display:none">
+      <div id="page-systems" class="page"
+        style="display:none; width:100%; height:calc(100vh - 46px); overflow-y:auto; padding:14px 18px; background:#07090d;">
         <div class="stat-grid">
           <div class="stat-card">
             <div class="stat-label">Total Servers</div>
@@ -380,7 +384,8 @@
       </div>
 
       <!-- ══ PAGE: ALERTS ══ -->
-      <div id="page-alerts" class="page" style="display:none">
+      <div id="page-alerts" class="page"
+        style="display:none; width:100%; height:calc(100vh - 46px); overflow-y:auto; padding:14px 18px; background:#07090d;">
         <div class="stat-grid">
           <div class="stat-card">
             <div class="stat-label">Total Alerts</div>
@@ -422,7 +427,8 @@
       </div>
 
       <!-- ══ PAGE: MODELS ══ -->
-      <div id="page-models" class="page" style="display:none">
+      <div id="page-models" class="page"
+        style="display:none; width:100%; height:calc(100vh - 46px); overflow-y:auto; padding:14px 18px; background:#07090d;">
         <div class="stat-grid">
           <div class="stat-card">
             <div class="stat-label">Model Status</div>
@@ -484,7 +490,8 @@
         </div>
 
         <!-- ══ PAGE: PREDICTIONS ══ -->
-        <div id="page-predictions" class="page" style="display:none">
+        <div id="page-predictions" class="page"
+          style="display:none; width:100%; height:calc(100vh - 46px); overflow-y:auto; padding:14px 18px; background:#07090d; flex-direction:column; gap:12px;">
           <div class="page-panel">
             <div class="page-panel-head">
               <span class="page-panel-title">⚠ Top Risk Server — Next 5 Minutes</span>
