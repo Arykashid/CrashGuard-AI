@@ -14,6 +14,8 @@ const S = {
   decisionCount: 0,
   wowTimers: {},
   currentPage: 'dashboard',
+  metrics: { total_decisions: 0, incidents_prevented: 0, false_positive_rate: 0 },
+  expandedRows: {},
 };
 
 const DC = {
@@ -23,6 +25,23 @@ const DC = {
   MONITOR: { color: '#eab308', bg: 'rgba(234,179,8,0.08)', border: 'rgba(234,179,8,0.35)', icon: '👁', cls: '' },
   STABLE: { color: '#22c55e', bg: 'rgba(34,197,94,0.05)', border: 'rgba(34,197,94,0.3)', icon: '✅', cls: '' },
 };
+
+// ── SPARKLINE HELPER ───────────────────────────────────────────
+function renderSparkline(serverId) {
+  const hist = S.history[serverId];
+  if (!hist || hist.length < 3) return '';
+  const BARS = '▁▂▃▄▅▆▇█';
+  const recent = hist.slice(-8);
+  const cpus = recent.map(h => h.cpu);
+  const mn = Math.min(...cpus), mx = Math.max(...cpus);
+  const range = mx - mn || 1;
+  const spark = cpus.map(v => {
+    const idx = Math.round(((v - mn) / range) * 7);
+    return BARS[Math.min(idx, 7)];
+  }).join('');
+  const color = mx > 80 ? '#ef4444' : mx > 60 ? '#f97316' : '#22c55e';
+  return `<span class="sparkline" style="color:${color}">${spark}</span>`;
+}
 
 // ── PAGE NAVIGATION ────────────────────────────────────────────
 function navigateTo(page) {
@@ -44,20 +63,21 @@ function navigateTo(page) {
     <span style="color:var(--text3)"> / </span>
     <span style="color:var(--text);font-weight:600">${labels[page] || page}</span>`;
 
-  // Show/hide pages — explicit dimensions to guarantee visibility
+  // Hide all pages
   document.querySelectorAll('.page').forEach(el => {
     el.style.display = 'none';
   });
+
+  // Show target page
   const activePage = document.getElementById('page-' + page);
-  if (activePage) {
-    activePage.style.display = 'block';
+  if (!activePage) return;
+
+  if (page === 'predictions') {
+    activePage.style.display = 'flex';
     activePage.style.flexDirection = 'column';
-    activePage.style.width = '100%';
-    activePage.style.height = 'calc(100vh - 46px)';
-    activePage.style.overflowY = 'auto';
-    activePage.style.padding = '14px 18px';
-    activePage.style.background = '#07090d';
-    activePage.style.gap = '12px';
+    renderPredictionsPage();
+  } else {
+    activePage.style.display = 'block';
   }
 
   // Render page-specific content
@@ -177,6 +197,7 @@ function processData(data) {
         decision: s.decision,
         severity: s.severity,
         cpu: s.current_cpu,
+        reason: s.reason || '',
       });
       if (S.alertLog.length > 50) S.alertLog.pop();
       S.alertCount++;
@@ -398,11 +419,10 @@ function renderAlertsPage() {
   const ac = document.getElementById('alrt-critical'); if (ac) ac.textContent = critical;
 
   if (S.alertLog.length === 0) {
-    el.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:20px">No alerts fired yet — trigger a spike from Demo Controls</td></tr>';
+    el.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:20px">No alerts fired yet — trigger a spike from Demo Controls</td></tr>';
     return;
   }
 
-  // FIX 3 — Strong severity colors with row background tinting
   const SEV = {
     CRITICAL: { color: '#ef4444', bg: 'rgba(239,68,68,0.12)', rowBg: 'rgba(239,68,68,0.04)' },
     HIGH: { color: '#f97316', bg: 'rgba(249,115,22,0.12)', rowBg: 'rgba(249,115,22,0.03)' },
@@ -416,12 +436,14 @@ function renderAlertsPage() {
 
   el.innerHTML = S.alertLog.map(a => {
     const s = SEV[a.severity] || SEV.LOW;
+    const reasonSnip = a.reason ? a.reason.substring(0, 120) : '—';
     return `<tr style="background:${s.rowBg}">
       <td style="font-family:var(--mono);font-size:11px;color:var(--text3)">${a.ts}</td>
       <td style="font-weight:600">${a.server}</td>
       <td><span style="font-size:11px;font-family:var(--mono);color:var(--text2)">${a.decision}</span></td>
       <td style="font-family:var(--mono);font-size:11px;color:${a.cpu > 80 ? '#ef4444' : a.cpu > 60 ? '#f97316' : '#94a3b8'}">${a.cpu?.toFixed(1) || '—'}%</td>
       <td><span style="font-size:10px;font-weight:700;padding:3px 10px;border-radius:4px;background:${s.bg};color:${s.color};border:1px solid ${s.color}40">${a.severity}</span></td>
+      <td style="font-size:11px;color:var(--text2);max-width:260px;line-height:1.4" title="${a.reason || ''}">${reasonSnip}</td>
     </tr>`;
   }).join('');
 }
@@ -446,17 +468,23 @@ function renderModelsPage() {
 // ── PREDICTIONS PAGE ───────────────────────────────────────────
 function renderPredictionsPage() {
   const el = document.getElementById('predictions-table-body');
-  if (!el) {
-    console.error('❌ predictions-table-body NOT FOUND');
-    return;
-  }
+  if (!el) { return; }
 
-  // Robust — works whether S.servers is dict or array
   const servers = Array.isArray(S.servers)
     ? S.servers
     : Object.values(S.servers || {});
 
-  console.log('Predictions data:', servers.length, 'servers');
+  // — Business impact stat cards (P5) —
+  const pdEl = document.getElementById('pred-downtime');
+  const ppEl = document.getElementById('pred-prevented');
+  const ptEl = document.getElementById('pred-total-decisions');
+  if (pdEl) {
+    const prevented = S.metrics.incidents_prevented || 0;
+    const minutes = (prevented * 4.2).toFixed(1);
+    pdEl.textContent = prevented > 0 ? minutes + ' min' : '0 min';
+  }
+  if (ppEl) ppEl.textContent = S.metrics.incidents_prevented || 0;
+  if (ptEl) ptEl.textContent = S.metrics.total_decisions || 0;
 
   if (servers.length === 0) {
     el.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#475569;padding:20px">Warming up — waiting for data...</td></tr>';
@@ -468,7 +496,7 @@ function renderPredictionsPage() {
     falling: '↘', rapidly_falling: '📉', volatile: '⚡', elevated: '↑'
   };
 
-  // Top risk line
+  // — Top risk line —
   const topRisk = servers.reduce((a, s) => {
     const cr = s.crash_risk_5min || s.spike_probability || 0;
     const acr = a.crash_risk_5min || a.spike_probability || 0;
@@ -481,37 +509,64 @@ function renderPredictionsPage() {
     topLine.style.color = cr > 60 ? '#ef4444' : cr > 35 ? '#f97316' : '#eab308';
   }
 
+  // — Build rows with CI, sparkline, expandable reason —
   el.innerHTML = servers.map(s => {
     const w = s.model_used === 'warming_up';
+    const sid = s.server_id;
     const diff = (s.predicted_cpu || 0) - (s.current_cpu || 0);
     const diffColor = diff > 5 ? '#ef4444' : diff < -5 ? '#22c55e' : '#94a3b8';
     const conf = (((s.adjusted_confidence || s.confidence || 0)) * 100).toFixed(0);
+    const confColor = conf > 70 ? '#22c55e' : conf > 40 ? '#eab308' : '#ef4444';
     const cr = (((s.crash_risk_5min || s.spike_probability || 0)) * 100).toFixed(0);
     const ticon = TREND_ICON[s.trend || 'stable'] || '→';
-
-    console.log("Decision value:", s.decision);
-    console.log("DC exists:", typeof DC);
-
-    const dc = (typeof DC !== 'undefined' && DC[s.decision])
-      ? DC[s.decision]
-      : {
-        bg: 'rgba(34,197,94,0.10)',
-        color: '#22c55e',
-        border: 'rgba(34,197,94,0.35)'
-      };
+    const dc = DC[s.decision] || DC.STABLE;
     const crColor = cr > 60 ? '#ef4444' : cr > 35 ? '#f97316' : '#22c55e';
     const cpuColor = s.current_cpu > 80 ? '#ef4444' : s.current_cpu > 60 ? '#f97316' : '#3b82f6';
-    return `<tr style="border-bottom:1px solid rgba(255,255,255,0.06)">
-      <td style="padding:10px 12px;font-weight:600;color:#e2e8f0">${s.server_name || s.server_id}</td>
-      <td style="padding:10px 12px;font-family:monospace;font-weight:700;color:${cpuColor}">${(s.current_cpu || 0).toFixed(1)}%</td>
-      <td style="padding:10px 12px;font-family:monospace;font-weight:700;color:#f97316">${w ? '—' : (s.predicted_cpu || 0).toFixed(1) + '%'}</td>
-      <td style="padding:10px 12px;font-family:monospace;color:${diffColor}">${w ? '—' : (diff > 0 ? '+' : '') + diff.toFixed(1) + '%'}</td>
-      <td style="padding:10px 12px;font-family:monospace;color:#22c55e">${w ? '—' : conf + '%'}</td>
+    const spark = renderSparkline(sid);
+    const ciL = s.ci_lower != null ? s.ci_lower.toFixed(1) : '—';
+    const ciU = s.ci_upper != null ? s.ci_upper.toFixed(1) : '—';
+    const expanded = S.expandedRows[sid];
+    const chevron = expanded ? '▾' : '▸';
+    const reason = s.reason || '';
+    const action = s.action || '';
+
+    let rows = `<tr class="pred-reason-toggle" onclick="togglePredRow('${sid}')" style="border-bottom:${expanded ? 'none' : '1px solid rgba(255,255,255,0.06)'}">
+      <td style="padding:10px 12px;font-weight:600;color:#e2e8f0"><span class="expand-chevron">${chevron}</span>${s.server_name || sid}</td>
       <td style="padding:10px 12px">${ticon} <span style="font-size:11px;color:#94a3b8">${s.trend || 'stable'}</span></td>
-      <td style="padding:10px 12px;font-family:monospace;font-weight:700;color:${crColor}">${w ? '—' : cr + '%'}</td>
+      <td style="padding:10px 12px;font-family:var(--mono);font-weight:700;color:${cpuColor}">${(s.current_cpu || 0).toFixed(1)}%${spark}</td>
+      <td style="padding:10px 12px">
+        <div style="font-family:var(--mono);font-weight:700;color:#f97316">${w ? '—' : (s.predicted_cpu || 0).toFixed(1) + '%'}</div>
+        ${w ? '' : `<div class="ci-range">CI: ${ciL}% – ${ciU}%</div>`}
+      </td>
+      <td style="padding:10px 12px;font-family:var(--mono);color:${diffColor}">${w ? '—' : (diff > 0 ? '+' : '') + diff.toFixed(1) + '%'}</td>
+      <td class="conf-cell" style="padding:10px 12px;font-family:var(--mono);color:${confColor}" title="Ensemble certainty = 1 − (CI width / 100). ${conf}% means model prediction bounds are tight.">${w ? '—' : conf + '%'}</td>
+      <td style="padding:10px 12px;font-family:var(--mono);font-weight:700;color:${crColor}">${w ? '—' : cr + '%'}</td>
       <td style="padding:10px 12px"><span style="font-size:10px;font-weight:700;padding:3px 8px;border-radius:4px;background:${dc.bg};color:${dc.color};border:1px solid ${dc.border}">${s.decision}</span></td>
     </tr>`;
+
+    if (expanded && !w) {
+      rows += `<tr class="pred-reason-row">
+        <td colspan="8" style="padding:0 12px 12px 30px">
+          <div class="pred-reason-content">
+            <div class="pred-reason-block">
+              <div class="pred-reason-label">Decision Reason</div>
+              <div class="pred-reason-text">${reason}</div>
+            </div>
+            <div class="pred-reason-block" style="max-width:320px">
+              <div class="pred-reason-label">Autonomous Action</div>
+              <div class="pred-action-text">⚙ ${action}</div>
+            </div>
+          </div>
+        </td>
+      </tr>`;
+    }
+    return rows;
   }).join('');
+}
+
+function togglePredRow(sid) {
+  S.expandedRows[sid] = !S.expandedRows[sid];
+  renderPredictionsPage();
 }
 
 // ── DEMO ──────────────────────────────────────────────────────
@@ -530,6 +585,7 @@ async function fetchMetrics() {
     const r = await fetch('/api/metrics');
     if (!r.ok) return;
     const d = await r.json();
+    S.metrics = d;
     const sd = document.getElementById('stat-decisions'); if (sd) sd.textContent = d.total_decisions || 0;
     const sp = document.getElementById('stat-prevented'); if (sp) sp.textContent = d.incidents_prevented || 0;
     const sf = document.getElementById('stat-fp');

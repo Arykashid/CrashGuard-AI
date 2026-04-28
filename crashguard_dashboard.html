@@ -414,11 +414,12 @@
                 <th>Decision</th>
                 <th>CPU at Alert</th>
                 <th>Severity</th>
+                <th style="min-width:200px">Reason</th>
               </tr>
             </thead>
             <tbody id="alerts-table-body">
               <tr>
-                <td colspan="5" style="text-align:center;color:var(--text3);padding:20px">No alerts fired yet — trigger
+                <td colspan="6" style="text-align:center;color:var(--text3);padding:20px">No alerts fired yet — trigger
                   a spike from Demo Controls</td>
               </tr>
             </tbody>
@@ -488,10 +489,29 @@
               decision engine fallback using behavioral signals and spike history</span>
           </div>
         </div>
+      </div>
 
-        <!-- ══ PAGE: PREDICTIONS ══ -->
-        <div id="page-predictions" class="page"
-          style="display:none; width:100%; height:calc(100vh - 46px); overflow-y:auto; padding:14px 18px; background:#07090d; flex-direction:column; gap:12px;">
+      <!-- ══ PAGE: PREDICTIONS ══ -->
+      <div id="page-predictions" class="page"
+        style="display:none;">
+          <!-- Business Impact Stats -->
+          <div class="stat-grid">
+            <div class="stat-card">
+              <div class="stat-label">Est. Downtime Prevented</div>
+              <div class="stat-value" id="pred-downtime" style="color:var(--green)">—</div>
+              <div class="stat-sub">based on avg 4.2 min MTTR per incident</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Incidents Prevented</div>
+              <div class="stat-value" id="pred-prevented" style="color:var(--cyan)">0</div>
+              <div class="stat-sub">autonomous interventions that averted spikes</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Total Autonomous Decisions</div>
+              <div class="stat-value" id="pred-total-decisions" style="color:var(--blue)">0</div>
+              <div class="stat-sub">SCALE · RESTART · ESCALATE · MONITOR · STABLE</div>
+            </div>
+          </div>
           <div class="page-panel">
             <div class="page-panel-head">
               <span class="page-panel-title">⚠ Top Risk Server — Next 5 Minutes</span>
@@ -505,11 +525,11 @@
               <thead>
                 <tr>
                   <th>Server</th>
-                  <th>Current CPU</th>
-                  <th>Predicted</th>
-                  <th>Δ Change</th>
-                  <th>Confidence</th>
                   <th>Trend</th>
+                  <th>Current CPU</th>
+                  <th>Predicted <span style="font-weight:400;color:var(--text3);font-size:9px">(80% CI)</span></th>
+                  <th>Δ Change</th>
+                  <th title="Ensemble certainty score = 1 − (CI width / 100). Higher value = tighter prediction bounds, lower model uncertainty.">Confidence ⓘ</th>
                   <th>Crash Risk 5m</th>
                   <th>Decision</th>
                 </tr>
@@ -522,7 +542,7 @@
             </table>
           </div>
           <div style="font-size:11px;color:var(--text3);padding:4px;font-family:var(--mono)">
-            ⚡ Updates every 2s · Crash Risk = spike probability + risk score + trend signal
+            ⚡ Updates every 2s · CI = 80% confidence interval (z=1.282) · Crash Risk = spike probability + risk score + trend signal
           </div>
         </div>
 
