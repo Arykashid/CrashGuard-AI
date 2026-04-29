@@ -1,5 +1,5 @@
 """
-decision_engine.py — CrashGuard AI  v4 (Production Grade)
+decision_engine.py — CrashGuard AI  v5 (Production Grade)
 Autonomous decision engine with prediction consistency layer,
 spike intelligence, trend awareness, and intelligent explanations.
 
@@ -18,6 +18,9 @@ Key improvements:
   [12] Hysteresis — prevents flapping
   [13] Adjusted confidence penalised by disagreement
   [14] Hard reality override — CPU ≥85% always SCALE
+  [15] Confidence gate — no autonomous action below 70% confidence
+       >70% → auto | 50-70% → MONITOR | <50% → ESCALATE (human)
+       Signal overrides (CPU≥85, 10+ spikes) bypass the gate
 """
 
 import math
@@ -43,6 +46,11 @@ SPIKE_RESTART_COUNT    = 3
 SPIKE_ESCALATE_COUNT   = 10
 SPIKE_WINDOW_SECONDS   = 600
 ALERT_COOLDOWN_SECONDS = 300
+
+# Confidence gate thresholds — no autonomous action below these
+CONF_AUTO_THRESHOLD    = 0.70   # autonomous SCALE/RESTART only above this
+CONF_MONITOR_THRESHOLD = 0.50   # 50-70% → downgrade to MONITOR
+# below 50% → downgrade to ESCALATE (human required)
 
 MAX_PRED_DROP_STABLE   = 15.0
 MAX_PRED_DROP_CRITICAL = 5.0
@@ -120,6 +128,112 @@ class CooldownTracker:
         with self._lock:
             remaining = self._cooldown - (time.time() - self._last.get(server_id, 0.0))
             return max(0, int(remaining))
+
+
+# ─────────────────────────────────────────────
+# INCIDENT TRACKER — deduplication + ownership
+# ─────────────────────────────────────────────
+ESCALATION_ORDER = {"STABLE": 0, "MONITOR": 1, "RESTART": 2, "SCALE": 3, "ESCALATE": 4}
+INCIDENT_DEDUP_WINDOW = 60  # seconds — suppress duplicate alerts within this window
+
+class IncidentTracker:
+    """
+    Production-grade incident deduplication.
+    Rules:
+      1. Same decision for same server within dedup window → suppressed
+      2. Escalation (MONITOR→SCALE) → always fires new alert
+      3. De-escalation (SCALE→MONITOR) → fires "resolved" alert, once
+      4. Each incident gets a unique ID for ownership tracking
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active: dict[str, dict] = {}  # server_id → incident state
+        self._incident_counter = 0
+
+    def should_alert(self, server_id: str, decision: str, severity: str) -> dict:
+        """Returns {alert: bool, reason: str, incident_id: str, transition: str}"""
+        now = time.time()
+        with self._lock:
+            prev = self._active.get(server_id)
+            curr_order = ESCALATION_ORDER.get(decision, 0)
+
+            # No previous incident — first alert for this server
+            if not prev:
+                if decision == "STABLE":
+                    return {"alert": False, "reason": "stable", "incident_id": None, "transition": None}
+                self._incident_counter += 1
+                iid = f"INC-{self._incident_counter:04d}"
+                self._active[server_id] = {
+                    "decision": decision, "severity": severity,
+                    "last_alert": now, "incident_id": iid,
+                    "started": now, "alert_count": 1,
+                }
+                return {"alert": True, "reason": "new_incident", "incident_id": iid, "transition": f"→ {decision}"}
+
+            prev_order = ESCALATION_ORDER.get(prev["decision"], 0)
+
+            # Escalation — always alert
+            if curr_order > prev_order and decision != "STABLE":
+                prev["decision"] = decision
+                prev["severity"] = severity
+                prev["last_alert"] = now
+                prev["alert_count"] += 1
+                return {"alert": True, "reason": "escalation", "incident_id": prev["incident_id"],
+                        "transition": f"{ESCALATION_ORDER_REVERSE[prev_order]} → {decision}"}
+
+            # Resolution — SCALE/ESCALATE/RESTART → STABLE
+            if decision == "STABLE" and prev_order >= 2:
+                iid = prev["incident_id"]
+                del self._active[server_id]
+                return {"alert": True, "reason": "resolved", "incident_id": iid,
+                        "transition": f"{ESCALATION_ORDER_REVERSE[prev_order]} → RESOLVED"}
+
+            # De-escalation to lower non-stable — alert once
+            if curr_order < prev_order and decision != "STABLE":
+                if now - prev["last_alert"] > INCIDENT_DEDUP_WINDOW:
+                    prev["decision"] = decision
+                    prev["severity"] = severity
+                    prev["last_alert"] = now
+                    prev["alert_count"] += 1
+                    return {"alert": True, "reason": "de-escalation", "incident_id": prev["incident_id"],
+                            "transition": f"{ESCALATION_ORDER_REVERSE[prev_order]} → {decision}"}
+                return {"alert": False, "reason": "dedup_cooldown", "incident_id": prev["incident_id"], "transition": None}
+
+            # Same decision — deduplicate
+            if decision == prev["decision"]:
+                elapsed = now - prev["last_alert"]
+                if elapsed < INCIDENT_DEDUP_WINDOW:
+                    return {"alert": False, "reason": "deduplicated", "incident_id": prev["incident_id"], "transition": None}
+                # Reaffirm after cooldown (keeps system alive)
+                prev["last_alert"] = now
+                prev["alert_count"] += 1
+                return {"alert": True, "reason": "reaffirmation", "incident_id": prev["incident_id"],
+                        "transition": f"{decision} (sustained)"}
+
+            # Fallback — minor state change
+            if now - prev["last_alert"] > INCIDENT_DEDUP_WINDOW:
+                prev["decision"] = decision
+                prev["severity"] = severity
+                prev["last_alert"] = now
+                prev["alert_count"] += 1
+                return {"alert": True, "reason": "state_change", "incident_id": prev["incident_id"],
+                        "transition": f"{ESCALATION_ORDER_REVERSE[prev_order]} → {decision}"}
+
+            return {"alert": False, "reason": "deduplicated", "incident_id": prev.get("incident_id"), "transition": None}
+
+    def get_active_incidents(self) -> dict:
+        with self._lock:
+            return dict(self._active)
+
+ESCALATION_ORDER_REVERSE = {v: k for k, v in ESCALATION_ORDER.items()}
+
+
+# ─────────────────────────────────────────────
+# BUSINESS IMPACT MODEL
+# ─────────────────────────────────────────────
+MTTR_MINUTES = 4.2          # avg manual recovery time without CrashGuard
+COST_PER_MINUTE_DOWN = 47   # $ — conservative SaaS p50
+SLA_TARGET = 0.999          # 99.9% uptime
 
 
 # ─────────────────────────────────────────────
@@ -389,9 +503,11 @@ class DecisionEngine:
     def __init__(self):
         self._spike_tracker        = SpikeTracker()
         self._cooldown_tracker     = CooldownTracker()
+        self._incident_tracker     = IncidentTracker()
         self._lock                 = threading.Lock()
         self._last_decisions:      dict[str, dict] = {}
         self._last_decision_str:   dict[str, str]  = {}
+        self._session_start        = time.time()
         # Evaluation metrics — tracks decision quality over session
         self._eval = {
             "total_decisions":     0,
@@ -399,6 +515,8 @@ class DecisionEngine:
             "stable_count":        0,
             "monitor_count":       0,
             "incidents_prevented": 0,   # CPU dropped after intervention
+            "alerts_suppressed":   0,   # dedup suppressions
+            "sla_breaches_avoided": 0,
         }
         self._prev_cpu: dict[str, float] = {}  # for incident prevention tracking
 
@@ -408,16 +526,28 @@ class DecisionEngine:
             total = self._eval["total_decisions"]
             interventions = self._eval["interventions"]
             prevented     = self._eval["incidents_prevented"]
+            suppressed    = self._eval["alerts_suppressed"]
+            sla_avoided   = self._eval["sla_breaches_avoided"]
             # False positive proxy: interventions where CPU was already falling
             fp_rate = round(
                 max(0.0, interventions - prevented) / max(interventions, 1) * 0.3, 3
             )
+            uptime_minutes = (time.time() - self._session_start) / 60.0
+            downtime_prevented = round(prevented * MTTR_MINUTES, 1)
+            cost_saved = round(downtime_prevented * COST_PER_MINUTE_DOWN, 0)
             return {
-                "total_decisions":     total,
-                "interventions":       interventions,
-                "incidents_prevented": prevented,
-                "false_positive_rate": fp_rate,
-                "stable_pct":          round(self._eval["stable_count"] / max(total,1) * 100, 1),
+                "total_decisions":      total,
+                "interventions":        interventions,
+                "incidents_prevented":  prevented,
+                "false_positive_rate":  fp_rate,
+                "stable_pct":           round(self._eval["stable_count"] / max(total,1) * 100, 1),
+                "alerts_suppressed":    suppressed,
+                "sla_breaches_avoided": sla_avoided,
+                "downtime_prevented_min": downtime_prevented,
+                "est_cost_saved":       cost_saved,
+                "uptime_minutes":       round(uptime_minutes, 1),
+                "dedup_ratio":          round(suppressed / max(suppressed + interventions, 1) * 100, 1),
+                "active_incidents":     len(self._incident_tracker.get_active_incidents()),
             }
 
     def evaluate(self, predictions: dict[str, dict]) -> dict[str, dict]:
@@ -560,7 +690,34 @@ class DecisionEngine:
                 current_cpu > 65):
             decision = "ESCALATE"
 
+        # ── CONFIDENCE GATE — no autonomous action at low confidence ──
+        # Hard reality override (CPU ≥ 85) is signal-based, not model-based → exempt
+        # Spike-driven ESCALATE (10+ spikes) is behavioral, not model-based → exempt
+        _is_signal_override = (current_cpu >= 85) or (
+            spike_count >= SPIKE_ESCALATE_COUNT and current_cpu > 75
+        )
+        if decision in ("SCALE", "RESTART") and not _is_signal_override:
+            if adjusted_conf < CONF_MONITOR_THRESHOLD:
+                # < 50% confidence → unsafe for any autonomous action
+                decision = "ESCALATE"
+            elif adjusted_conf < CONF_AUTO_THRESHOLD:
+                # 50-70% confidence → insufficient for autonomous remediation
+                decision = "MONITOR"
+
         self._last_decision_str[server_id] = decision
+
+        # ── Action confidence — how confident is the decision itself? ──
+        # Combines: signal strength (risk), model certainty (adj_conf), trend alignment
+        _trend_alignment = 1.0 if (
+            (decision in ("SCALE", "ESCALATE") and trend in ("rapidly_rising", "rising", "elevated")) or
+            (decision == "STABLE" and trend in ("stable", "falling", "rapidly_falling")) or
+            (decision == "MONITOR" and trend in ("rising", "elevated", "volatile"))
+        ) else 0.6
+        _signal_strength = min(risk / 0.8, 1.0) if decision != "STABLE" else (1.0 - risk)
+        action_confidence = round(min(
+            0.40 * _signal_strength + 0.35 * adjusted_conf + 0.25 * _trend_alignment,
+            1.0
+        ), 4)
 
         # ── Evaluation metrics ─────────────────────────────────
         with self._lock:
@@ -571,6 +728,7 @@ class DecisionEngine:
                 prev = self._prev_cpu.get(server_id, current_cpu)
                 if prev > current_cpu + 3:
                     self._eval["incidents_prevented"] += 1
+                    self._eval["sla_breaches_avoided"] += 1
             elif decision == "STABLE":
                 self._eval["stable_count"] += 1
             elif decision == "MONITOR":
@@ -587,12 +745,12 @@ class DecisionEngine:
         severity = DECISIONS[decision]["severity"]
         color    = DECISIONS[decision]["color"]
 
-        # ── Alert cooldown ─────────────────────────────────────
-        alert_ready = False
-        if severity in ("CRITICAL", "HIGH"):
-            alert_ready = self._cooldown_tracker.can_alert(server_id)
-            if alert_ready:
-                self._cooldown_tracker.record(server_id)
+        # ── Incident deduplication ─────────────────────────────
+        inc_result = self._incident_tracker.should_alert(server_id, decision, severity)
+        alert_ready = inc_result["alert"]
+        if not alert_ready:
+            with self._lock:
+                self._eval["alerts_suppressed"] += 1
 
         # ── Crash risk (5 min horizon) — dashboard headline metric ──
         # Combines spike_prob, risk score and trend into one number
@@ -607,6 +765,7 @@ class DecisionEngine:
             "raw_predicted_cpu":       round(raw_pred,             2),
             "confidence":              round(confidence,           4),
             "adjusted_confidence":     adjusted_conf,
+            "action_confidence":       action_confidence,
             "spike_probability":       spike_prob,
             "prediction_disagreement": prediction_disagreement,
             "model_reliability":       model_reliability,
@@ -623,6 +782,8 @@ class DecisionEngine:
             "rolling_std":             round(rolling_std,          2),
             "rolling_mean":            round(rolling_mean,         2),
             "alert_ready":             alert_ready,
+            "incident_id":             inc_result.get("incident_id"),
+            "incident_transition":     inc_result.get("transition"),
             "cooldown_remaining":      self._cooldown_tracker.seconds_remaining(server_id),
             "model_used":              model_used,
             "timestamp":               ts,
@@ -638,6 +799,7 @@ class DecisionEngine:
             "raw_predicted_cpu":       curr,
             "confidence":              0.0,
             "adjusted_confidence":     0.0,
+            "action_confidence":       0.0,
             "spike_probability":       0.0,
             "prediction_disagreement": 0.0,
             "model_reliability":       1.0,

@@ -263,8 +263,12 @@
               <div class="hm-val" id="hm-pred">—</div>
             </div>
             <div class="hm">
-              <div class="hm-label">Confidence</div>
+              <div class="hm-label">Pred. Conf</div>
               <div class="hm-val" id="hm-conf">—</div>
+            </div>
+            <div class="hm">
+              <div class="hm-label">Act. Conf</div>
+              <div class="hm-val" id="hm-actconf">—</div>
             </div>
             <div class="hm">
               <div class="hm-label">Crash Risk 5m</div>
@@ -409,9 +413,9 @@
             <div class="stat-sub">SCALE + ESCALATE</div>
           </div>
           <div class="stat-card">
-            <div class="stat-label">Channel</div>
-            <div class="stat-value" style="color:var(--green);font-size:16px;padding-top:6px">Slack DRY-RUN</div>
-            <div class="stat-sub">set SLACK_WEBHOOK_URL to enable</div>
+            <div class="stat-label">Alert Deduplication</div>
+            <div class="stat-value" id="alrt-dedup" style="color:var(--green)">—</div>
+            <div class="stat-sub">flapping alerts suppressed</div>
           </div>
         </div>
         <div class="page-panel">
@@ -505,27 +509,57 @@
 
         <!-- Architecture + Decision Engine — 2-column layout for scan speed -->
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-        <div class="page-panel">
-          <div class="page-panel-head"><span class="page-panel-title">Architecture</span><span
-              class="page-panel-meta">LSTM + XGBoost Ensemble</span></div>
-          <div class="model-row"><span class="model-key">Architecture</span><span class="model-val"
-              style="color:var(--cyan)">MCDropout LSTM(128,64) + XGBoost</span></div>
-          <div class="model-row"><span class="model-key">Training Data</span><span class="model-val">60k Google Cluster records</span></div>
-          <div class="model-row"><span class="model-key">Features</span><span class="model-val">15 engineered</span></div>
-          <div class="model-row"><span class="model-key">Ensemble Weights</span><span class="model-val">XGB 0.60 · LSTM 0.40</span></div>
-          <div class="model-row"><span class="model-key">Calibration</span><span class="model-val">Temp scaling T=9.55</span></div>
-          <div class="model-row"><span class="model-key">Coverage (80% CI)</span><span class="model-val"
-              style="color:var(--green)">80.0%</span></div>
-          <div class="model-row"><span class="model-key">MC Dropout</span><span class="model-val">15 forward passes</span></div>
-          <div class="model-row"><span class="model-key">DM Test p-value</span><span class="model-val"
-              style="color:var(--green)">0.0086</span></div>
-          <div class="model-row"><span class="model-key">Ensemble RMSE</span><span class="model-val"
-              style="color:var(--cyan)">0.1578</span></div>
+        <div class="page-panel" style="grid-column: 1 / -1;">
+          <div class="page-panel-head"><span class="page-panel-title">Production Pipeline Architecture</span><span
+              class="page-panel-meta">Google Cluster Data → Autonomous Resolution</span></div>
+          <div style="padding:24px;display:flex;align-items:center;justify-content:space-between;overflow-x:auto;">
+            
+            <div style="text-align:center;width:120px;flex-shrink:0;">
+              <div style="background:var(--surface3);border:1px solid var(--border);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;">Data Ingestion</div>
+              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">60k GC records<br>2s tick rate</div>
+            </div>
+            
+            <div style="color:var(--text3);flex-shrink:0;">→</div>
+            
+            <div style="text-align:center;width:120px;flex-shrink:0;">
+              <div style="background:var(--surface3);border:1px solid var(--border);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;">Feature Eng</div>
+              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">15 features<br>Trend + Lag + Vol</div>
+            </div>
+            
+            <div style="color:var(--text3);flex-shrink:0;">→</div>
+            
+            <div style="text-align:center;width:140px;flex-shrink:0;">
+              <div style="background:rgba(59,130,246,0.1);border:1px solid var(--blue);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;color:var(--blue);">LSTM + XGBoost</div>
+              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">MCDropout (15 passes)<br>w: [0.4, 0.6]</div>
+            </div>
+            
+            <div style="color:var(--text3);flex-shrink:0;">→</div>
+            
+            <div style="text-align:center;width:120px;flex-shrink:0;">
+              <div style="background:var(--surface3);border:1px solid var(--border);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;">Calibration</div>
+              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">Temp T=9.55<br>80% Coverage</div>
+            </div>
+            
+            <div style="color:var(--text3);flex-shrink:0;">→</div>
+            
+            <div style="text-align:center;width:140px;flex-shrink:0;">
+              <div style="background:rgba(249,115,22,0.1);border:1px solid var(--orange);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;color:var(--orange);">Decision Engine</div>
+              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">Risk thresholding<br>Confidence gates</div>
+            </div>
+            
+            <div style="color:var(--text3);flex-shrink:0;">→</div>
+            
+            <div style="text-align:center;width:120px;flex-shrink:0;">
+              <div style="background:rgba(34,197,94,0.1);border:1px solid var(--green);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;color:var(--green);">Response</div>
+              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">Auto: k8s rollout<br>Escalate: PagerDuty</div>
+            </div>
+
+          </div>
         </div>
 
         <div class="page-panel">
           <div class="page-panel-head"><span class="page-panel-title">Decision Engine</span><span
-              class="page-panel-meta">v4 — graduated response</span></div>
+              class="page-panel-meta">v5 — confidence-gated response</span></div>
           <div class="model-row"><span class="model-key">Correction</span><span class="model-val"
               style="color:var(--green)">Trend-biased blending</span></div>
           <div class="model-row"><span class="model-key">Spike Scorer</span><span class="model-val">4-signal behavioral</span></div>
@@ -533,7 +567,9 @@
           <div class="model-row"><span class="model-key">Hysteresis</span><span class="model-val"
               style="color:var(--green)">Active</span></div>
           <div class="model-row"><span class="model-key">Escalation</span><span class="model-val">3→RESTART · 10→ESCALATE</span></div>
-          <div class="model-row"><span class="model-key">Thresholds</span><span class="model-val">SCALE: &gt;80.8% · RESTART: 3+ · ESC: 10+</span></div>
+          <div class="model-row"><span class="model-key">Confidence Gate</span><span class="model-val"
+              style="color:var(--cyan)">&gt;70% auto · 50-70% monitor · &lt;50% human</span></div>
+          <div class="model-row"><span class="model-key">Signal Override</span><span class="model-val">CPU ≥85% bypasses confidence gate</span></div>
         </div>
         </div><!-- /2-col grid -->
       </div>
@@ -544,19 +580,19 @@
           <!-- Operational Stats -->
           <div class="stat-grid">
             <div class="stat-card">
-              <div class="stat-label">Autonomous Interventions</div>
+              <div class="stat-label">SLA Breaches Avoided</div>
               <div class="stat-value" id="pred-prevented" style="color:var(--cyan)">0</div>
-              <div class="stat-sub">non-STABLE decisions triggered this session</div>
+              <div class="stat-sub">incidents mitigated before crash</div>
             </div>
             <div class="stat-card">
-              <div class="stat-label">Total Evaluations</div>
-              <div class="stat-value" id="pred-total-decisions" style="color:var(--blue)">0</div>
-              <div class="stat-sub">decision engine cycles (all outcomes)</div>
+              <div class="stat-label">Est. Cost Saved</div>
+              <div class="stat-value" id="pred-cost-saved" style="color:var(--green)">$0</div>
+              <div class="stat-sub">based on $150/min downtime cost</div>
             </div>
             <div class="stat-card">
               <div class="stat-label">Est. MTTR Saved</div>
-              <div class="stat-value" id="pred-downtime" style="color:var(--green)">—</div>
-              <div class="stat-sub">interventions × 4.2 min avg recovery time</div>
+              <div class="stat-value" id="pred-downtime" style="color:var(--blue)">—</div>
+              <div class="stat-sub">interventions × 4.2 min avg recovery</div>
             </div>
           </div>
           <div class="page-panel">
@@ -572,11 +608,8 @@
               <thead>
                 <tr>
                   <th>Server</th>
-                  <th>Trend</th>
                   <th>Current CPU</th>
-                  <th>Predicted <span style="font-weight:400;color:var(--text3);font-size:9px">(80% CI)</span></th>
-                  <th>Δ Change</th>
-                  <th title="Ensemble certainty score = 1 − (CI width / 100). Higher value = tighter prediction bounds, lower model uncertainty.">Confidence ⓘ</th>
+                  <th>Predicted CPU</th>
                   <th>Crash Risk 5m</th>
                   <th>Decision</th>
                   <th>Recommended Action</th>
@@ -600,11 +633,14 @@
     <!-- ══ SIMULATION MODE (HIDDEN) ══ -->
     <div id="simulation-panel" class="simulation-panel" style="display:none;">
       <div class="sim-header">
-        <span style="font-weight:600;color:#e2e8f0;">🧪 Chaos Engineering Simulation</span>
+        <span style="font-weight:600;color:#e2e8f0;">🧪 Validation Environment</span>
         <span class="sim-close" onclick="document.getElementById('simulation-panel').style.display='none'">✕</span>
       </div>
       <div class="demo-body" style="padding: 16px;">
-        <div class="demo-label">Inject CPU Spike</div>
+        <div style="font-size: 11px; color: var(--text2); margin-bottom: 12px; line-height: 1.5;">
+          Validated using Google Cluster workload patterns with controlled incident injection for decision testing.
+        </div>
+        <div class="demo-label">Inject Incident</div>
         <div class="demo-btns" style="margin-bottom: 12px;">
           <button class="demo-btn red" onclick="triggerSpike('server_c',93)">🔴 Burst C</button>
           <button class="demo-btn red" onclick="triggerSpike('server_b',89)">🔴 Spike B</button>

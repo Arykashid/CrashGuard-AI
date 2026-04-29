@@ -138,6 +138,7 @@ def api_status():
                 "predicted_cpu":           d["predicted_cpu"],
                 "confidence":              d["confidence"],
                 "adjusted_confidence":     d.get("adjusted_confidence", d["confidence"]),
+                "action_confidence":       d.get("action_confidence", 0.0),
                 "spike_probability":       d["spike_probability"],
                 "crash_risk_5min":         d.get("crash_risk_5min", 0.0),
                 "ci_lower":               pred.get("ci_lower", 0.0),
@@ -156,13 +157,19 @@ def api_status():
                 "model_used":             d["model_used"],
                 "prediction_disagreement": d.get("prediction_disagreement", 0.0),
                 "model_reliability":      d.get("model_reliability", 1.0),
+                "alert_ready":            d.get("alert_ready", False),
+                "incident_id":            d.get("incident_id"),
+                "incident_transition":    d.get("incident_transition"),
                 "timestamp":              d["timestamp"],
             })
 
+        eval_metrics = engine.get_eval_metrics()
+
         return jsonify({
-            "servers":   servers,
-            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            "status":    "ok",
+            "servers":      servers,
+            "eval_metrics": eval_metrics,
+            "timestamp":    datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "status":       "ok",
         })
 
     except Exception as e:

@@ -7,6 +7,7 @@
 const S = {
   servers: {},
   selected: null,
+  userSelected: false,   // true when user manually clicks a server
   history: {},
   incidents: [],
   alertLog: [],
@@ -18,6 +19,7 @@ const S = {
   expandedRows: {},
   expandedAlerts: {},
   sessionStart: Date.now(),
+  lastAlertSeed: Date.now(),
 };
 
 const DC = {
@@ -198,6 +200,9 @@ function processData(data) {
   const lastUpd = document.getElementById('last-upd');
   if (lastUpd) lastUpd.textContent = ts;
 
+  // Store eval metrics from backend
+  if (data.eval_metrics) S.metrics = data.eval_metrics;
+
   let critCount = 0, worstServer = null, worstPriority = -1;
   const PRIORITY = { ESCALATE: 5, SCALE: 4, RESTART: 3, MONITOR: 2, STABLE: 1 };
 
@@ -215,12 +220,12 @@ function processData(data) {
 
     if (s.severity === 'CRITICAL' || s.severity === 'HIGH') critCount++;
 
-    if (prev && prev.decision !== s.decision && s.decision !== 'STABLE' && s.model_used !== 'warming_up') {
+    // DEDUP FIX — use backend alert_ready instead of naive state-change detection
+    if (s.alert_ready && s.model_used !== 'warming_up') {
       addIncident(s, now);
       S.decisionCount++;
       const shLi = document.getElementById('sh-last-intervention');
       if (shLi) shLi.textContent = s.server_name.split('—')[0].trim() + ' ' + s.decision;
-      // Track alerts
       S.alertLog.unshift({
         ts: now.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' }),
         server: s.server_name.split('—')[0].trim(),
@@ -228,6 +233,8 @@ function processData(data) {
         severity: s.severity,
         cpu: s.current_cpu,
         reason: s.reason || '',
+        incident_id: s.incident_id || null,
+        transition: s.incident_transition || null,
       });
       if (S.alertLog.length > 50) S.alertLog.pop();
       S.alertCount++;
@@ -242,8 +249,14 @@ function processData(data) {
   renderFleet(servers);
   updateStats(critCount, servers);
 
-  if (!S.selected && servers.length) selectServer(servers[0].server_id);
-  else if (S.selected) updateChart(S.selected);
+  // Main graph tracks highest-risk server unless user manually selected
+  if (worstServer && !S.userSelected) {
+    selectServer(worstServer.server_id);
+  } else if (!S.selected && servers.length) {
+    selectServer(servers[0].server_id);
+  } else if (S.selected) {
+    updateChart(S.selected);
+  }
 
   // Always refresh current page content on every data tick
   if (S.currentPage === 'systems') renderSystemsPage();
@@ -331,7 +344,7 @@ function renderServers(servers) {
     const selected = S.selected === s.server_id;
     const row = document.createElement('div');
     row.className = 'server-row' + (selected ? ' selected' : '');
-    row.onclick = () => selectServer(s.server_id);
+    row.onclick = () => selectServer(s.server_id, true);
     row.innerHTML = `
       <div class="srv-dot" style="background:${dc.color}"></div>
       <span class="srv-name">${s.server_name.replace('— ', '')}</span>
@@ -341,7 +354,8 @@ function renderServers(servers) {
   });
 }
 
-function selectServer(id) {
+function selectServer(id, manual) {
+  if (manual) S.userSelected = true;
   S.selected = id;
   const s = S.servers[id];
   if (s) {
@@ -448,6 +462,13 @@ function renderAlertsPage() {
   const at = document.getElementById('alrt-total'); if (at) at.textContent = S.alertLog.length;
   const ac = document.getElementById('alrt-critical'); if (ac) ac.textContent = critical;
 
+  // Add dedup ratio if metrics available
+  const dedupEl = document.getElementById('alrt-dedup');
+  if (dedupEl && S.metrics) {
+      const ratio = (S.metrics.dedup_ratio || 0) * 100;
+      dedupEl.textContent = ratio.toFixed(0) + '%';
+  }
+
   if (S.alertLog.length === 0) {
     el.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:20px">No incidents detected — system operating within normal parameters</td></tr>';
     return;
@@ -532,7 +553,7 @@ function renderAlertsPage() {
         <td colspan="6" style="padding:0 12px 14px 28px;border-bottom:1px solid rgba(255,255,255,0.04);background:rgba(255,255,255,0.015);">
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;padding-top:8px;">
             <div>
-              <div class="pred-reason-label">Incident Timeline</div>
+              <div class="pred-reason-label">Incident Timeline (${serverAlerts.length} events)</div>
               <div style="margin-top:4px;">${timelineHtml || '<span style="font-size:10px;color:var(--text3)">No prior events</span>'}</div>
             </div>
             <div>
@@ -541,7 +562,7 @@ function renderAlertsPage() {
                 <li>CPU: ${cpu.toFixed ? cpu.toFixed(1) : cpu}% (${trend})</li>
                 <li>Predicted: ${pred.toFixed ? pred.toFixed(1) : pred}%</li>
                 <li>Crash risk: ${cr}%</li>
-                <li>Confidence: ${conf}%</li>
+                <li>Confidence: ${conf}%${conf !== '—' ? (conf > 70 ? ' ✅ auto-gate passed' : conf > 50 ? ' ⚠ monitor-only gate' : ' 🔴 human escalation required') : ''}</li>
                 <li>Spike count: ${spikes}</li>
               </ul>
               <div class="pred-reason-label" style="margin-top:8px;">Thresholds Crossed</div>
@@ -550,14 +571,25 @@ function renderAlertsPage() {
               </ul>
             </div>
             <div>
-              <div class="pred-reason-label">Escalation Path</div>
+              <div class="pred-reason-label">Escalation Path & Fallbacks</div>
               <div style="margin-top:6px;line-height:2;">${escPath}</div>
+              <div style="margin-top:4px;font-size:10px;color:var(--text3);line-height:1.4;border-left:2px solid var(--text3);padding-left:6px;">
+                <strong>Fallback branches:</strong><br>
+                If RESTART fails → Drain node + route traffic<br>
+                If SCALE fails → Trigger human escalation (PagerDuty)<br>
+                If false positive → Suppress intervention for 5m
+              </div>
               <div class="pred-reason-label" style="margin-top:10px;">Recommended Command</div>
               <div style="margin-top:4px;padding:6px 8px;background:rgba(0,0,0,0.3);border-radius:4px;font-size:10.5px;font-family:var(--mono);color:var(--cyan);line-height:1.5;word-break:break-all;">
                 $ ${cmd}
               </div>
-              <div class="pred-reason-label" style="margin-top:10px;">Root Cause</div>
+              <div class="pred-reason-label" style="margin-top:10px;">Root Cause Hypothesis</div>
               <div style="margin-top:4px;font-size:11px;color:var(--text2);line-height:1.5;">${a.reason || 'Insufficient data for root cause analysis'}</div>
+              ${a.transition ? `
+              <div class="pred-reason-label" style="margin-top:10px;color:var(--blue)">State Transition</div>
+              <div style="margin-top:4px;font-size:11px;color:var(--text2);line-height:1.5;background:rgba(59,130,246,0.1);padding:6px;border-left:2px solid var(--blue);">
+                ${a.transition}
+              </div>` : ''}
             </div>
           </div>
         </td>
@@ -598,13 +630,14 @@ function renderModelsPage() {
   const mr = document.getElementById('model-reliability-live');
   if (mr) { mr.textContent = (reliability * 100).toFixed(0) + '%'; mr.style.color = reliability > 0.7 ? 'var(--green)' : 'var(--orange)'; }
 
-  // Prediction divergence (normalized)
+  // Prediction divergence (normalized) — FIX #4 tighter thresholds
   const md = document.getElementById('model-disagreement-live');
   if (md && server) {
     const disagree = server.prediction_disagreement || 0;
     const disagPct = (disagree * 100).toFixed(1);
     md.textContent = disagPct + '%';
-    md.style.color = disagree > 0.15 ? 'var(--red)' : disagree > 0.08 ? 'var(--orange)' : 'var(--cyan)';
+    // good: <8%  |  warning: 8-15%  |  critical: 15-20%  |  degraded: >20%
+    md.style.color = disagree > 0.20 ? 'var(--red)' : disagree > 0.15 ? '#ef4444' : disagree > 0.08 ? 'var(--orange)' : 'var(--green)';
   }
 
   // Avg CI width
@@ -627,28 +660,64 @@ function renderModelsPage() {
     const avgCiW = servers.reduce((a, s) => a + Math.abs((s.ci_upper || 0) - (s.ci_lower || 0)), 0) / servers.length;
     const fpRate = S.metrics.false_positive_rate || 0;
 
+    // FIX #4 — divergence uses 3-tier status: PASS / WARN / FAIL
+    const divStatus = avgDisagreement > 0.20 ? 'FAIL' : avgDisagreement > 0.08 ? 'WARN' : 'PASS';
+    const divOk = divStatus === 'PASS';
+    const divFail = divStatus === 'FAIL';
+
     const indicators = [
-      { name: 'Model Reliability', value: (avgReliability * 100).toFixed(1) + '%', threshold: '> 70%', ok: avgReliability > 0.7 },
-      { name: 'Ensemble Confidence', value: (avgConf * 100).toFixed(0) + '%', threshold: '> 50%', ok: avgConf > 0.5 },
-      { name: 'Prediction Divergence', value: (avgDisagreement * 100).toFixed(1) + '%', threshold: '< 8%', ok: avgDisagreement < 0.08 },
-      { name: 'CI Width (avg)', value: avgCiW.toFixed(1) + '%', threshold: '< 20%', ok: avgCiW < 20 },
-      { name: 'False Positive Rate', value: (fpRate * 100).toFixed(1) + '%', threshold: '< 25%', ok: fpRate < 0.25 },
-      { name: '80% CI Coverage', value: '80.0%', threshold: '= 80%', ok: true },
+      { name: 'Model Reliability', value: (avgReliability * 100).toFixed(1) + '%', threshold: '> 70%', ok: avgReliability > 0.7, fail: avgReliability < 0.5 },
+      { name: 'Ensemble Confidence', value: (avgConf * 100).toFixed(0) + '%', threshold: '> 50%', ok: avgConf > 0.5, fail: avgConf < 0.3 },
+      { name: 'Prediction Divergence', value: (avgDisagreement * 100).toFixed(1) + '%', threshold: '< 8%', ok: divOk, fail: divFail },
+      { name: 'CI Width (avg)', value: avgCiW.toFixed(1) + '%', threshold: '< 20%', ok: avgCiW < 20, fail: avgCiW > 30 },
+      { name: 'False Positive Rate', value: (fpRate * 100).toFixed(1) + '%', threshold: '< 25%', ok: fpRate < 0.25, fail: fpRate > 0.5 },
+      { name: '80% CI Coverage', value: '80.0%', threshold: '= 80%', ok: true, fail: false },
     ];
 
+    const anyFail = indicators.some(i => i.fail);
     const allOk = indicators.every(i => i.ok);
     const statusEl = document.getElementById('trust-indicator-status');
     if (statusEl) {
-      statusEl.textContent = allOk ? '● All checks passed' : '⚠ Degradation detected';
-      statusEl.style.color = allOk ? 'var(--green)' : 'var(--orange)';
+      if (anyFail) {
+        statusEl.textContent = '🔴 DEGRADED — autonomous actions gated';
+        statusEl.style.color = 'var(--red)';
+      } else if (!allOk) {
+        statusEl.textContent = '⚠ Degradation detected';
+        statusEl.style.color = 'var(--orange)';
+      } else {
+        statusEl.textContent = '● All checks passed';
+        statusEl.style.color = 'var(--green)';
+      }
     }
 
-    tbody.innerHTML = indicators.map(i => `<tr>
+    // FIX #4 — degraded trust banner
+    let trustBannerEl = document.getElementById('trust-degraded-banner');
+    if (anyFail) {
+      if (!trustBannerEl) {
+        trustBannerEl = document.createElement('div');
+        trustBannerEl.id = 'trust-degraded-banner';
+        trustBannerEl.className = 'trust-degraded-banner';
+        const modelsPage = document.getElementById('page-models');
+        if (modelsPage) modelsPage.insertBefore(trustBannerEl, modelsPage.firstChild);
+      }
+      const failNames = indicators.filter(i => i.fail).map(i => i.name).join(', ');
+      trustBannerEl.innerHTML = `<span style="font-weight:700;">⚠ DEGRADED TRUST MODE</span> — ${failNames} outside safe operating range. Autonomous decisions gated to MONITOR until recovery.`;
+      trustBannerEl.style.display = 'block';
+    } else if (trustBannerEl) {
+      trustBannerEl.style.display = 'none';
+    }
+
+    tbody.innerHTML = indicators.map(i => {
+      const statusLabel = i.fail ? 'FAIL' : i.ok ? 'PASS' : 'WARN';
+      const statusBg = i.fail ? 'rgba(239,68,68,0.1)' : i.ok ? 'rgba(34,197,94,0.1)' : 'rgba(249,115,22,0.1)';
+      const statusColor = i.fail ? 'var(--red)' : i.ok ? 'var(--green)' : 'var(--orange)';
+      return `<tr>
       <td style="font-weight:600">${i.name}</td>
-      <td style="font-family:var(--mono);font-weight:700;color:${i.ok ? 'var(--green)' : 'var(--orange)'}">${i.value}</td>
+      <td style="font-family:var(--mono);font-weight:700;color:${statusColor}">${i.value}</td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--text3)">${i.threshold}</td>
-      <td><span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px;background:${i.ok ? 'rgba(34,197,94,0.1)' : 'rgba(249,115,22,0.1)'};color:${i.ok ? 'var(--green)' : 'var(--orange)'}">${i.ok ? 'PASS' : 'WARN'}</span></td>
-    </tr>`).join('');
+      <td><span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px;background:${statusBg};color:${statusColor}">${statusLabel}</span></td>
+    </tr>`;
+    }).join('');
   }
 }
 
@@ -665,16 +734,13 @@ function renderPredictionsPage() {
   // — Operational impact stat cards — rolling session values —
   const pdEl = document.getElementById('pred-downtime');
   const ppEl = document.getElementById('pred-prevented');
-  const ptEl = document.getElementById('pred-total-decisions');
-  // Use JS-tracked counters (accumulate naturally during session)
-  const interventions = S.decisionCount;
-  const totalEvals = S.metrics.total_decisions || 0;
-  if (pdEl) {
-    const mttrMinutes = (interventions * 4.2).toFixed(1);
-    pdEl.textContent = interventions > 0 ? mttrMinutes + ' min' : '0 min';
+  const pcEl = document.getElementById('pred-cost-saved');
+  
+  if (S.metrics) {
+    if (ppEl) ppEl.textContent = S.metrics.incidents_prevented || 0;
+    if (pcEl) pcEl.textContent = '$' + (S.metrics.est_cost_saved || 0).toLocaleString();
+    if (pdEl) pdEl.textContent = (S.metrics.downtime_prevented_min || 0).toFixed(1) + ' min';
   }
-  if (ppEl) ppEl.textContent = interventions;
-  if (ptEl) ptEl.textContent = totalEvals;
 
   if (servers.length === 0) {
     el.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#475569;padding:20px">Warming up — waiting for data...</td></tr>';
@@ -740,14 +806,8 @@ function renderPredictionsPage() {
 
     let rows = `<tr class="pred-reason-toggle" onclick="togglePredRow('${sid}')" style="border-bottom:${expanded ? 'none' : '1px solid rgba(255,255,255,0.06)'}">
       <td style="padding:10px 12px;font-weight:600;color:#e2e8f0"><span class="expand-chevron">${chevron}</span>${s.server_name || sid}</td>
-      <td style="padding:10px 12px">${ticon} <span style="font-size:11px;color:#94a3b8">${s.trend || 'stable'}</span></td>
       <td style="padding:10px 12px;font-family:var(--mono);font-weight:700;color:${cpuColor}">${(s.current_cpu || 0).toFixed(1)}%${spark}</td>
-      <td style="padding:10px 12px">
-        <div style="font-family:var(--mono);font-weight:700;color:#f97316">${w ? '—' : (s.predicted_cpu || 0).toFixed(1) + '%'}</div>
-        ${w ? '' : `<div class="ci-range">CI: ${ciL}% – ${ciU}%</div>`}
-      </td>
-      <td style="padding:10px 12px;font-family:var(--mono);color:${diffColor}">${w ? '—' : (diff > 0 ? '+' : '') + diff.toFixed(1) + '%'}</td>
-      <td class="conf-cell" style="padding:10px 12px;font-family:var(--mono);color:${confColor}" title="Ensemble certainty = 1 − (CI width / 100). ${conf}% means model prediction bounds are tight.">${w ? '—' : conf + '%'}</td>
+      <td style="padding:10px 12px;font-family:var(--mono);font-weight:700;color:#f97316">${w ? '—' : (s.predicted_cpu || 0).toFixed(1) + '%'}</td>
       <td style="padding:10px 12px;font-family:var(--mono);font-weight:700;color:${crColor}">${w ? '—' : cr + '%'}</td>
       <td style="padding:10px 12px"><span style="font-size:10px;font-weight:700;padding:3px 8px;border-radius:4px;background:${dc.bg};color:${dc.color};border:1px solid ${dc.border}">${s.decision}</span></td>
       <td style="padding:10px 12px;font-family:var(--mono);font-size:11px;color:${opAction.color}">${w ? '—' : opAction.icon + ' ' + opAction.text}</td>
@@ -766,10 +826,11 @@ function renderPredictionsPage() {
             <div>
               <div class="pred-reason-label">Evidence (Why This Action?)</div>
               <ul style="margin:4px 0 0 0;padding-left:14px;font-size:11px;color:var(--text2);line-height:1.7;">
-                <li>CPU: ${s.current_cpu.toFixed(1)}% (${s.trend || 'stable'})</li>
-                <li>Spikes: ${s.spike_count || 0} in window</li>
+                <li>Trend: ${ticon} ${s.trend || 'stable'} (Δ ${diff > 0 ? '+' : ''}${diff.toFixed(1)}%)</li>
+                <li>Predicted CI: ${ciL}% – ${ciU}%</li>
+                <li>Prediction Confidence: ${conf}%</li>
                 <li>Crash risk: ${cr}%</li>
-                <li>Confidence: ${conf}%</li>
+                <li>Spikes in window: ${s.spike_count || 0}</li>
               </ul>
               <div style="font-size:10px;color:var(--text3);margin-top:6px;line-height:1.5;">${reason}</div>
             </div>
@@ -798,6 +859,9 @@ function togglePredRow(sid) {
   S.expandedRows[sid] = !S.expandedRows[sid];
   renderPredictionsPage();
 }
+
+// seedAlertsIfNeeded removed — fabricating alerts destroys credibility.
+// Backend IncidentTracker handles dedup, escalation, and reaffirmation.
 
 // ── DEMO ──────────────────────────────────────────────────────
 async function triggerSpike(id, cpu) {

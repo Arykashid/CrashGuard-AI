@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-04-12T21:04:19.324768",
+  "trained_at": "2026-04-18T20:26:20.229260",
   "config": {
     "window_size": 60,
     "forecast_horizon": 1,
@@ -15,19 +15,19 @@
     "mc_samples": 100,
     "num_features": 15,
     "log1p_target": true,
-    "calibration_T": 9.4742
+    "calibration_T": 9.5518
   },
   "metrics": {
-    "LSTM_RMSE": 0.232763,
-    "Ensemble_RMSE": 0.157781,
-    "LSTM_MAE": 0.20152,
+    "LSTM_RMSE": 0.232787,
+    "Ensemble_RMSE": 0.157782,
+    "LSTM_MAE": 0.201507,
     "Ensemble_MAE": 0.116521,
-    "Coverage_90": 0.1435,
-    "Confidence": 0.9367,
-    "Avg_CI_Width": 0.128103,
-    "Spike_RMSE": 0.477094,
+    "Coverage_90": 0.1437,
+    "Confidence": 0.9368,
+    "Avg_CI_Width": 0.127901,
+    "Spike_RMSE": 0.477101,
     "Normal_RMSE": 0.124059,
-    "Best_Val_Loss": 0.020441,
-    "Calibration_T": 9.4742
+    "Best_Val_Loss": 0.020509,
+    "Calibration_T": 9.5518
   }
 }
