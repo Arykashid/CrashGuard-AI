@@ -415,7 +415,7 @@
           <div class="stat-card">
             <div class="stat-label">Alert Deduplication</div>
             <div class="stat-value" id="alrt-dedup" style="color:var(--green)">—</div>
-            <div class="stat-sub">flapping alerts suppressed</div>
+            <div class="stat-sub">suppressed vs total alerts</div>
           </div>
         </div>
         <div class="page-panel">
@@ -509,51 +509,77 @@
 
         <!-- Architecture + Decision Engine — 2-column layout for scan speed -->
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-        <div class="page-panel" style="grid-column: 1 / -1;">
-          <div class="page-panel-head"><span class="page-panel-title">Production Pipeline Architecture</span><span
-              class="page-panel-meta">Google Cluster Data → Autonomous Resolution</span></div>
-          <div style="padding:24px;display:flex;align-items:center;justify-content:space-between;overflow-x:auto;">
-            
-            <div style="text-align:center;width:120px;flex-shrink:0;">
-              <div style="background:var(--surface3);border:1px solid var(--border);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;">Data Ingestion</div>
-              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">60k GC records<br>2s tick rate</div>
-            </div>
-            
-            <div style="color:var(--text3);flex-shrink:0;">→</div>
-            
-            <div style="text-align:center;width:120px;flex-shrink:0;">
-              <div style="background:var(--surface3);border:1px solid var(--border);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;">Feature Eng</div>
-              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">15 features<br>Trend + Lag + Vol</div>
-            </div>
-            
-            <div style="color:var(--text3);flex-shrink:0;">→</div>
-            
-            <div style="text-align:center;width:140px;flex-shrink:0;">
-              <div style="background:rgba(59,130,246,0.1);border:1px solid var(--blue);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;color:var(--blue);">LSTM + XGBoost</div>
-              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">MCDropout (15 passes)<br>w: [0.4, 0.6]</div>
-            </div>
-            
-            <div style="color:var(--text3);flex-shrink:0;">→</div>
-            
-            <div style="text-align:center;width:120px;flex-shrink:0;">
-              <div style="background:var(--surface3);border:1px solid var(--border);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;">Calibration</div>
-              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">Temp T=9.55<br>80% Coverage</div>
-            </div>
-            
-            <div style="color:var(--text3);flex-shrink:0;">→</div>
-            
-            <div style="text-align:center;width:140px;flex-shrink:0;">
-              <div style="background:rgba(249,115,22,0.1);border:1px solid var(--orange);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;color:var(--orange);">Decision Engine</div>
-              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">Risk thresholding<br>Confidence gates</div>
-            </div>
-            
-            <div style="color:var(--text3);flex-shrink:0;">→</div>
-            
-            <div style="text-align:center;width:120px;flex-shrink:0;">
-              <div style="background:rgba(34,197,94,0.1);border:1px solid var(--green);border-radius:6px;padding:12px 8px;font-size:11px;font-weight:600;margin-bottom:8px;color:var(--green);">Response</div>
-              <div style="font-size:9.5px;color:var(--text3);font-family:var(--mono);">Auto: k8s rollout<br>Escalate: PagerDuty</div>
-            </div>
+        <div class="page-panel" style="grid-column: span 2; background: linear-gradient(145deg, rgba(15,23,42,0.6) 0%, rgba(30,41,59,0.4) 100%);">
+          <div class="page-panel-head"><span class="page-panel-title">End-to-End Decision Pipeline</span><span
+              class="page-panel-meta">v5 Architecture</span></div>
+          <div style="padding:24px 16px; overflow-x:auto;">
+            <div style="display:flex; align-items:center; gap: 8px; font-family:var(--mono);">
 
+              <!-- Data Layer -->
+              <div style="flex-shrink:0; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); border-radius:8px; padding:12px; width:130px;">
+                <div style="font-size:10px; color:var(--text3); font-weight:600; text-transform:uppercase; margin-bottom:4px; letter-spacing:0.5px;">Layer 1</div>
+                <div style="font-size:12px; font-family:var(--sans); font-weight:600; color:var(--text); margin-bottom:6px;">Data Ingestion</div>
+                <div style="font-size:10px; color:var(--text2); line-height:1.4;">60k GC records<br>2s tick rate</div>
+              </div>
+
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--text3)" stroke-width="2" style="flex-shrink:0; opacity:0.5;"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+
+              <!-- Feature Layer -->
+              <div style="flex-shrink:0; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); border-radius:8px; padding:12px; width:130px;">
+                <div style="font-size:10px; color:var(--text3); font-weight:600; text-transform:uppercase; margin-bottom:4px; letter-spacing:0.5px;">Layer 2</div>
+                <div style="font-size:12px; font-family:var(--sans); font-weight:600; color:var(--text); margin-bottom:6px;">Feature Eng</div>
+                <div style="font-size:10px; color:var(--text2); line-height:1.4;">Trend + Lag + Vol<br>15 signals</div>
+              </div>
+
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--text3)" stroke-width="2" style="flex-shrink:0; opacity:0.5;"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+
+              <!-- ML Layer -->
+              <div style="flex-shrink:0; background:rgba(59,130,246,0.1); border:1px solid rgba(59,130,246,0.3); border-radius:8px; padding:12px; width:150px; position:relative;">
+                <div style="position:absolute; top:-6px; right:-6px; background:var(--blue); color:#fff; font-size:8px; padding:2px 6px; border-radius:4px; font-weight:bold;">ENSEMBLE</div>
+                <div style="font-size:10px; color:var(--blue); font-weight:600; text-transform:uppercase; margin-bottom:4px; letter-spacing:0.5px;">Layer 3</div>
+                <div style="font-size:12px; font-family:var(--sans); font-weight:600; color:#fff; margin-bottom:6px;">LSTM + XGBoost</div>
+                <div style="font-size:10px; color:var(--text2); line-height:1.4;">MCDropout passes<br>Dynamic weighting</div>
+              </div>
+
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--text3)" stroke-width="2" style="flex-shrink:0; opacity:0.5;"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+
+              <!-- Calibration -->
+              <div style="flex-shrink:0; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); border-radius:8px; padding:12px; width:130px;">
+                <div style="font-size:10px; color:var(--text3); font-weight:600; text-transform:uppercase; margin-bottom:4px; letter-spacing:0.5px;">Layer 4</div>
+                <div style="font-size:12px; font-family:var(--sans); font-weight:600; color:var(--text); margin-bottom:6px;">Conf. Calibration</div>
+                <div style="font-size:10px; color:var(--text2); line-height:1.4;">Temp T=9.55<br>Trust Gating</div>
+              </div>
+
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--text3)" stroke-width="2" style="flex-shrink:0; opacity:0.5;"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+
+              <!-- Decision Engine -->
+              <div style="flex-shrink:0; background:rgba(249,115,22,0.1); border:1px solid rgba(249,115,22,0.3); border-radius:8px; padding:12px; width:140px;">
+                <div style="font-size:10px; color:var(--orange); font-weight:600; text-transform:uppercase; margin-bottom:4px; letter-spacing:0.5px;">Layer 5</div>
+                <div style="font-size:12px; font-family:var(--sans); font-weight:600; color:#fff; margin-bottom:6px;">Decision Engine</div>
+                <div style="font-size:10px; color:var(--text2); line-height:1.4;">Risk Thresholds<br>Hysteresis Check</div>
+              </div>
+
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--text3)" stroke-width="2" style="flex-shrink:0; opacity:0.5;"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+
+              <!-- Action Layer -->
+              <div style="flex-shrink:0; display:flex; flex-direction:column; gap:8px;">
+                <div style="background:rgba(34,197,94,0.1); border:1px solid rgba(34,197,94,0.3); border-radius:8px; padding:8px 12px; width:150px; display:flex; align-items:center; gap:8px;">
+                  <span style="font-size:14px;">⚙️</span>
+                  <div>
+                    <div style="font-size:11px; font-family:var(--sans); font-weight:600; color:var(--green);">k8s Action Layer</div>
+                    <div style="font-size:9px; color:var(--text2);">Autoscale / Restart</div>
+                  </div>
+                </div>
+                <div style="background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.3); border-radius:8px; padding:8px 12px; width:150px; display:flex; align-items:center; gap:8px;">
+                  <span style="font-size:14px;">📟</span>
+                  <div>
+                    <div style="font-size:11px; font-family:var(--sans); font-weight:600; color:var(--red);">Human Escalation</div>
+                    <div style="font-size:9px; color:var(--text2);">PagerDuty fallback</div>
+                  </div>
+                </div>
+              </div>
+
+            </div>
           </div>
         </div>
 
@@ -575,8 +601,7 @@
       </div>
 
       <!-- ══ PAGE: PREDICTIONS ══ -->
-      <div id="page-predictions" class="page"
-        style="display:none;">
+      <div id="page-predictions" class="page" style="display:none;">
           <!-- Operational Stats -->
           <div class="stat-grid">
             <div class="stat-card">

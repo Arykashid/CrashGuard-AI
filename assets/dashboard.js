@@ -321,6 +321,8 @@ function updateHero(s) {
   document.getElementById('hm-curr').textContent = s.current_cpu.toFixed(1) + '%';
   document.getElementById('hm-pred').textContent = w ? '—' : s.predicted_cpu.toFixed(1) + '%';
   document.getElementById('hm-conf').textContent = w ? '—' : ((s.adjusted_confidence || s.confidence) * 100).toFixed(0) + '%';
+  const actConfEl = document.getElementById('hm-actconf');
+  if (actConfEl) actConfEl.textContent = w ? '—' : ((s.action_confidence || 0) * 100).toFixed(0) + '%';
   const cr = s.crash_risk_5min || s.spike_probability || 0;
   document.getElementById('hm-spike').textContent = w ? '—' : (cr * 100).toFixed(0) + '%';
   document.getElementById('hm-spikect').textContent = s.spike_count;
@@ -433,10 +435,6 @@ function renderSystemsPage() {
     const pct = Math.min(s.current_cpu, 100);
     const TDISPLAY = { rapidly_rising: '📈 Rising fast', rising: '↗ Rising', stable: '→ Stable', falling: '↘ Falling', rapidly_falling: '📉 Falling fast', volatile: '⚡ Volatile', elevated: '↑ Elevated' };
     let trendStr = s.trend ? (TDISPLAY[s.trend] || s.trend) : '—';
-    if (!s.trend && s.predicted_cpu && s.current_cpu) {
-      const d = s.predicted_cpu - s.current_cpu;
-      trendStr = d > 5 ? '↗ Rising' : d < -5 ? '↘ Falling' : '→ Stable';
-    }
     return `<tr>
       <td><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:7px;height:7px;border-radius:50%;background:${dc.color};display:inline-block"></span>${s.server_name}</span></td>
       <td>
@@ -465,8 +463,9 @@ function renderAlertsPage() {
   // Add dedup ratio if metrics available
   const dedupEl = document.getElementById('alrt-dedup');
   if (dedupEl && S.metrics) {
-      const ratio = (S.metrics.dedup_ratio || 0) * 100;
-      dedupEl.textContent = ratio.toFixed(0) + '%';
+      const suppressed = S.metrics.alerts_suppressed || 0;
+      const total = suppressed + (S.metrics.interventions || 0);
+      dedupEl.textContent = `${suppressed} / ${total}`;
   }
 
   if (S.alertLog.length === 0) {
