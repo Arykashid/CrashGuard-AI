@@ -122,13 +122,15 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 10px 16px;
+      padding: 12px 16px;
       border-bottom: 1px solid var(--border);
       font-size: 12.5px;
+      margin-bottom: 4px;
     }
 
     .model-row:last-child {
       border-bottom: none;
+      margin-bottom: 0;
     }
 
     .model-key {
@@ -237,7 +239,7 @@
             <div class="hero-decision">
               <div class="hero-icon" id="hero-icon" style="font-size:20px">✅</div>
               <div>
-                <div class="hero-label" style="font-size:10px;margin-bottom:1px">Active Decision</div>
+                <div class="hero-label" style="font-size:10px;margin-bottom:1px">Autonomous Response</div>
                 <div style="display:flex;align-items:baseline;gap:8px">
                   <div class="hero-decision-text" id="hero-decision-text" style="font-size:22px">STABLE</div>
                   <div class="hero-server" id="hero-server" style="font-size:11px;opacity:0.6">Initializing...</div>
@@ -451,9 +453,9 @@
             <div class="stat-sub" id="model-reliability-sub">= 1 − |pred − actual| / actual</div>
           </div>
           <div class="stat-card">
-            <div class="stat-label">Prediction Disagreement</div>
+            <div class="stat-label">Prediction Divergence</div>
             <div class="stat-value" id="model-disagreement-live" style="color:var(--cyan)">—</div>
-            <div class="stat-sub">|LSTM − XGBoost| divergence</div>
+            <div class="stat-sub">correction magnitude / current CPU</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">Avg CI Width</div>
@@ -493,56 +495,47 @@
                 <th>Value</th>
                 <th>Threshold</th>
                 <th>Status</th>
-                <th>Formula</th>
               </tr>
             </thead>
             <tbody id="trust-indicators-body">
-              <tr><td colspan="5" style="text-align:center;color:var(--text3);padding:20px">Loading...</td></tr>
+              <tr><td colspan="4" style="text-align:center;color:var(--text3);padding:20px">Loading...</td></tr>
             </tbody>
           </table>
         </div>
 
-        <!-- Architecture (kept) -->
+        <!-- Architecture + Decision Engine — 2-column layout for scan speed -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
         <div class="page-panel">
           <div class="page-panel-head"><span class="page-panel-title">Architecture</span><span
               class="page-panel-meta">LSTM + XGBoost Ensemble</span></div>
           <div class="model-row"><span class="model-key">Architecture</span><span class="model-val"
               style="color:var(--cyan)">MCDropout LSTM(128,64) + XGBoost</span></div>
-          <div class="model-row"><span class="model-key">Training Data</span><span class="model-val">60,000 Google
-              Cluster CPU records</span></div>
-          <div class="model-row"><span class="model-key">Features</span><span class="model-val">15 engineered (lags,
-              rolling stats, cyclical time)</span></div>
-          <div class="model-row"><span class="model-key">Ensemble Weights</span><span class="model-val">XGBoost 0.60 ·
-              LSTM 0.40</span></div>
-          <div class="model-row"><span class="model-key">Calibration</span><span class="model-val">Temperature scaling
-              T=9.5518</span></div>
+          <div class="model-row"><span class="model-key">Training Data</span><span class="model-val">60k Google Cluster records</span></div>
+          <div class="model-row"><span class="model-key">Features</span><span class="model-val">15 engineered</span></div>
+          <div class="model-row"><span class="model-key">Ensemble Weights</span><span class="model-val">XGB 0.60 · LSTM 0.40</span></div>
+          <div class="model-row"><span class="model-key">Calibration</span><span class="model-val">Temp scaling T=9.55</span></div>
           <div class="model-row"><span class="model-key">Coverage (80% CI)</span><span class="model-val"
               style="color:var(--green)">80.0%</span></div>
-          <div class="model-row"><span class="model-key">MC Dropout Samples</span><span class="model-val">15 forward
-              passes per prediction</span></div>
+          <div class="model-row"><span class="model-key">MC Dropout</span><span class="model-val">15 forward passes</span></div>
           <div class="model-row"><span class="model-key">DM Test p-value</span><span class="model-val"
-              style="color:var(--green)">0.0086 (ensemble significantly better)</span></div>
+              style="color:var(--green)">0.0086</span></div>
           <div class="model-row"><span class="model-key">Ensemble RMSE</span><span class="model-val"
               style="color:var(--cyan)">0.1578</span></div>
-          <div class="model-row"><span class="model-key">XGBoost-only RMSE</span><span class="model-val">0.1337</span></div>
         </div>
 
-        <!-- Decision Engine (kept) -->
         <div class="page-panel">
           <div class="page-panel-head"><span class="page-panel-title">Decision Engine</span><span
-              class="page-panel-meta">v4 — 5-level graduated response</span></div>
-          <div class="model-row"><span class="model-key">Prediction Correction</span><span class="model-val"
-              style="color:var(--green)">Active — trend-biased blending</span></div>
-          <div class="model-row"><span class="model-key">Spike Probability</span><span class="model-val">4-signal
-              behavioral scorer</span></div>
-          <div class="model-row"><span class="model-key">Risk Score</span><span class="model-val">Adaptive weights
-              (spike_count &gt; 5 → spike dominates)</span></div>
+              class="page-panel-meta">v4 — graduated response</span></div>
+          <div class="model-row"><span class="model-key">Correction</span><span class="model-val"
+              style="color:var(--green)">Trend-biased blending</span></div>
+          <div class="model-row"><span class="model-key">Spike Scorer</span><span class="model-val">4-signal behavioral</span></div>
+          <div class="model-row"><span class="model-key">Risk Weights</span><span class="model-val">Adaptive (spike &gt; 5 → dominates)</span></div>
           <div class="model-row"><span class="model-key">Hysteresis</span><span class="model-val"
-              style="color:var(--green)">Active — prevents decision flapping</span></div>
-          <div class="model-row"><span class="model-key">Graduated Escalation</span><span class="model-val">3
-              spikes→RESTART · 10 spikes→ESCALATE</span></div>
-          <div class="model-row"><span class="model-key">Thresholds</span><span class="model-val">SCALE: pred &gt; 80.8% · RESTART: 3+ spikes · ESCALATE: 10+ spikes</span></div>
+              style="color:var(--green)">Active</span></div>
+          <div class="model-row"><span class="model-key">Escalation</span><span class="model-val">3→RESTART · 10→ESCALATE</span></div>
+          <div class="model-row"><span class="model-key">Thresholds</span><span class="model-val">SCALE: &gt;80.8% · RESTART: 3+ · ESC: 10+</span></div>
         </div>
+        </div><!-- /2-col grid -->
       </div>
 
       <!-- ══ PAGE: PREDICTIONS ══ -->

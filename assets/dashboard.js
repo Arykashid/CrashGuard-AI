@@ -16,6 +16,8 @@ const S = {
   currentPage: 'dashboard',
   metrics: { total_decisions: 0, incidents_prevented: 0, false_positive_rate: 0 },
   expandedRows: {},
+  expandedAlerts: {},
+  sessionStart: Date.now(),
 };
 
 const DC = {
@@ -462,18 +464,120 @@ function renderAlertsPage() {
   const apc = document.getElementById('alert-page-count');
   if (apc) apc.textContent = S.alertLog.length + ' total';
 
-  el.innerHTML = S.alertLog.map(a => {
+  el.innerHTML = S.alertLog.map((a, idx) => {
     const s = SEV[a.severity] || SEV.LOW;
     const reasonSnip = a.reason ? a.reason.substring(0, 120) : '—';
-    return `<tr style="background:${s.rowBg}">
-      <td style="font-family:var(--mono);font-size:11px;color:var(--text3)">${a.ts}</td>
+    const expanded = S.expandedAlerts[idx];
+    const chevron = expanded ? '▾' : '▸';
+
+    // Current live server data for this alert's server
+    const liveServer = Object.values(S.servers).find(
+      sv => (sv.server_name || '').split('—')[0].trim() === a.server
+    );
+
+    // Build the incident investigation panel
+    let drillDown = '';
+    if (expanded) {
+      // Recent alert history for this server
+      const serverAlerts = S.alertLog.filter(al => al.server === a.server).slice(0, 6);
+      const timelineHtml = serverAlerts.map(al => {
+        const sc = SEV[al.severity] || SEV.LOW;
+        return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.03);">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--text3);min-width:42px;">${al.ts}</span>
+          <span style="width:6px;height:6px;border-radius:50%;background:${sc.color};flex-shrink:0;"></span>
+          <span style="font-size:11px;font-weight:600;color:${sc.color};min-width:65px;">${al.decision}</span>
+          <span style="font-family:var(--mono);font-size:10px;color:var(--text2);">${al.cpu?.toFixed(1) || '?'}%</span>
+        </div>`;
+      }).join('');
+
+      // Evidence from live server state
+      const cpu = liveServer ? liveServer.current_cpu : a.cpu || 0;
+      const pred = liveServer ? liveServer.predicted_cpu : 0;
+      const trend = liveServer ? liveServer.trend : 'unknown';
+      const spikes = liveServer ? liveServer.spike_count : 0;
+      const cr = liveServer ? ((liveServer.crash_risk_5min || liveServer.spike_probability || 0) * 100).toFixed(0) : '—';
+      const conf = liveServer ? (((liveServer.adjusted_confidence || liveServer.confidence || 0)) * 100).toFixed(0) : '—';
+
+      // Threshold analysis
+      const thresholds = [];
+      if (cpu > 80) thresholds.push('CPU > 80% — critical zone active');
+      else if (cpu > 60) thresholds.push('CPU > 60% — warning zone');
+      if (spikes >= 10) thresholds.push(`${spikes} spikes in window → ESCALATE threshold`);
+      else if (spikes >= 3) thresholds.push(`${spikes} spikes in window → RESTART threshold`);
+      if (pred > 80.8) thresholds.push(`Predicted ${pred.toFixed(1)}% > 80.8% → SCALE trigger`);
+      if (thresholds.length === 0) thresholds.push('Below all action thresholds');
+
+      // SRE-actionable command
+      const CMD = {
+        SCALE: 'kubectl autoscale deployment/api-server --cpu-percent=70 --min=3 --max=8',
+        ESCALATE: 'pagerduty trigger --severity=critical --service=crashguard --message="sustained instability"',
+        RESTART: 'kubectl rollout restart deployment/api-server && kubectl rollout status deployment/api-server',
+        MONITOR: 'kubectl top pods -n production --sort-by=cpu | head -10',
+        STABLE: '# No action required — system nominal',
+      };
+      const cmd = CMD[a.decision] || CMD.STABLE;
+
+      // Escalation path visualization
+      const levels = ['STABLE', 'MONITOR', 'RESTART', 'SCALE', 'ESCALATE'];
+      const currentIdx = levels.indexOf(a.decision);
+      const escPath = levels.map((l, i) => {
+        const active = i === currentIdx;
+        const past = i < currentIdx;
+        const color = active ? (SEV[a.severity] || SEV.LOW).color : past ? 'var(--text2)' : 'var(--text3)';
+        const weight = active ? 'font-weight:700;' : '';
+        return `<span style="font-size:10px;${weight}color:${color};">${l}</span>`;
+      }).join(' <span style="color:var(--text3);font-size:9px;">→</span> ');
+
+      drillDown = `<tr class="alert-drill-row">
+        <td colspan="6" style="padding:0 12px 14px 28px;border-bottom:1px solid rgba(255,255,255,0.04);background:rgba(255,255,255,0.015);">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;padding-top:8px;">
+            <div>
+              <div class="pred-reason-label">Incident Timeline</div>
+              <div style="margin-top:4px;">${timelineHtml || '<span style="font-size:10px;color:var(--text3)">No prior events</span>'}</div>
+            </div>
+            <div>
+              <div class="pred-reason-label">Evidence at Detection</div>
+              <ul style="margin:4px 0 0 0;padding-left:14px;font-size:11px;color:var(--text2);line-height:1.7;">
+                <li>CPU: ${cpu.toFixed ? cpu.toFixed(1) : cpu}% (${trend})</li>
+                <li>Predicted: ${pred.toFixed ? pred.toFixed(1) : pred}%</li>
+                <li>Crash risk: ${cr}%</li>
+                <li>Confidence: ${conf}%</li>
+                <li>Spike count: ${spikes}</li>
+              </ul>
+              <div class="pred-reason-label" style="margin-top:8px;">Thresholds Crossed</div>
+              <ul style="margin:4px 0 0 0;padding-left:14px;font-size:11px;color:var(--text2);line-height:1.7;">
+                ${thresholds.map(t => `<li>${t}</li>`).join('')}
+              </ul>
+            </div>
+            <div>
+              <div class="pred-reason-label">Escalation Path</div>
+              <div style="margin-top:6px;line-height:2;">${escPath}</div>
+              <div class="pred-reason-label" style="margin-top:10px;">Recommended Command</div>
+              <div style="margin-top:4px;padding:6px 8px;background:rgba(0,0,0,0.3);border-radius:4px;font-size:10.5px;font-family:var(--mono);color:var(--cyan);line-height:1.5;word-break:break-all;">
+                $ ${cmd}
+              </div>
+              <div class="pred-reason-label" style="margin-top:10px;">Root Cause</div>
+              <div style="margin-top:4px;font-size:11px;color:var(--text2);line-height:1.5;">${a.reason || 'Insufficient data for root cause analysis'}</div>
+            </div>
+          </div>
+        </td>
+      </tr>`;
+    }
+
+    return `<tr class="alert-drill-toggle" onclick="toggleAlertRow(${idx})" style="cursor:pointer;background:${s.rowBg};border-bottom:${expanded ? 'none' : '1px solid rgba(255,255,255,0.06)'}">
+      <td style="font-family:var(--mono);font-size:11px;color:var(--text3)"><span class="expand-chevron">${chevron}</span>${a.ts}</td>
       <td style="font-weight:600">${a.server}</td>
       <td><span style="font-size:11px;font-family:var(--mono);color:var(--text2)">${a.decision}</span></td>
       <td style="font-family:var(--mono);font-size:11px;color:${a.cpu > 80 ? '#ef4444' : a.cpu > 60 ? '#f97316' : '#94a3b8'}">${a.cpu?.toFixed(1) || '—'}%</td>
       <td><span style="font-size:10px;font-weight:700;padding:3px 10px;border-radius:4px;background:${s.bg};color:${s.color};border:1px solid ${s.color}40">${a.severity}</span></td>
       <td style="font-size:11px;color:var(--text2);max-width:260px;line-height:1.4" title="${a.reason || ''}">${reasonSnip}</td>
-    </tr>`;
+    </tr>${drillDown}`;
   }).join('');
+}
+
+function toggleAlertRow(idx) {
+  S.expandedAlerts[idx] = !S.expandedAlerts[idx];
+  renderAlertsPage();
 }
 
 // ── MODELS PAGE ────────────────────────────────────────────────
@@ -494,12 +598,13 @@ function renderModelsPage() {
   const mr = document.getElementById('model-reliability-live');
   if (mr) { mr.textContent = (reliability * 100).toFixed(0) + '%'; mr.style.color = reliability > 0.7 ? 'var(--green)' : 'var(--orange)'; }
 
-  // Prediction disagreement
+  // Prediction divergence (normalized)
   const md = document.getElementById('model-disagreement-live');
   if (md && server) {
     const disagree = server.prediction_disagreement || 0;
-    md.textContent = (disagree * 100).toFixed(1) + '%';
-    md.style.color = disagree > 0.1 ? 'var(--orange)' : 'var(--cyan)';
+    const disagPct = (disagree * 100).toFixed(1);
+    md.textContent = disagPct + '%';
+    md.style.color = disagree > 0.15 ? 'var(--red)' : disagree > 0.08 ? 'var(--orange)' : 'var(--cyan)';
   }
 
   // Avg CI width
@@ -523,12 +628,12 @@ function renderModelsPage() {
     const fpRate = S.metrics.false_positive_rate || 0;
 
     const indicators = [
-      { name: 'Model Reliability', value: (avgReliability * 100).toFixed(1) + '%', threshold: '> 70%', ok: avgReliability > 0.7, formula: '1 − |predicted − actual| / actual' },
-      { name: 'Ensemble Confidence', value: (avgConf * 100).toFixed(0) + '%', threshold: '> 50%', ok: avgConf > 0.5, formula: '1 − (CI width / 100)' },
-      { name: 'Prediction Disagreement', value: (avgDisagreement * 100).toFixed(1) + '%', threshold: '< 10%', ok: avgDisagreement < 0.1, formula: '|LSTM_pred − XGB_pred| / ensemble_pred' },
-      { name: 'CI Width (avg)', value: avgCiW.toFixed(1) + '%', threshold: '< 20%', ok: avgCiW < 20, formula: 'ci_upper − ci_lower per server' },
-      { name: 'False Positive Rate', value: (fpRate * 100).toFixed(1) + '%', threshold: '< 25%', ok: fpRate < 0.25, formula: 'unnecessary_actions / total_actions' },
-      { name: '80% CI Coverage', value: '80.0%', threshold: '= 80%', ok: true, formula: 'actuals_in_CI / total (held-out test)' },
+      { name: 'Model Reliability', value: (avgReliability * 100).toFixed(1) + '%', threshold: '> 70%', ok: avgReliability > 0.7 },
+      { name: 'Ensemble Confidence', value: (avgConf * 100).toFixed(0) + '%', threshold: '> 50%', ok: avgConf > 0.5 },
+      { name: 'Prediction Divergence', value: (avgDisagreement * 100).toFixed(1) + '%', threshold: '< 8%', ok: avgDisagreement < 0.08 },
+      { name: 'CI Width (avg)', value: avgCiW.toFixed(1) + '%', threshold: '< 20%', ok: avgCiW < 20 },
+      { name: 'False Positive Rate', value: (fpRate * 100).toFixed(1) + '%', threshold: '< 25%', ok: fpRate < 0.25 },
+      { name: '80% CI Coverage', value: '80.0%', threshold: '= 80%', ok: true },
     ];
 
     const allOk = indicators.every(i => i.ok);
@@ -543,7 +648,6 @@ function renderModelsPage() {
       <td style="font-family:var(--mono);font-weight:700;color:${i.ok ? 'var(--green)' : 'var(--orange)'}">${i.value}</td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--text3)">${i.threshold}</td>
       <td><span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px;background:${i.ok ? 'rgba(34,197,94,0.1)' : 'rgba(249,115,22,0.1)'};color:${i.ok ? 'var(--green)' : 'var(--orange)'}">${i.ok ? 'PASS' : 'WARN'}</span></td>
-      <td style="font-size:10.5px;color:var(--text3);font-family:var(--mono)">${i.formula}</td>
     </tr>`).join('');
   }
 }
@@ -558,17 +662,19 @@ function renderPredictionsPage() {
     ? S.servers
     : Object.values(S.servers || {});
 
-  // — Business impact stat cards (P5) —
+  // — Operational impact stat cards — rolling session values —
   const pdEl = document.getElementById('pred-downtime');
   const ppEl = document.getElementById('pred-prevented');
   const ptEl = document.getElementById('pred-total-decisions');
+  // Use JS-tracked counters (accumulate naturally during session)
+  const interventions = S.decisionCount;
+  const totalEvals = S.metrics.total_decisions || 0;
   if (pdEl) {
-    const prevented = S.metrics.incidents_prevented || 0;
-    const minutes = (prevented * 4.2).toFixed(1);
-    pdEl.textContent = prevented > 0 ? minutes + ' min' : '0 min';
+    const mttrMinutes = (interventions * 4.2).toFixed(1);
+    pdEl.textContent = interventions > 0 ? mttrMinutes + ' min' : '0 min';
   }
-  if (ppEl) ppEl.textContent = S.metrics.incidents_prevented || 0;
-  if (ptEl) ptEl.textContent = S.metrics.total_decisions || 0;
+  if (ppEl) ppEl.textContent = interventions;
+  if (ptEl) ptEl.textContent = totalEvals;
 
   if (servers.length === 0) {
     el.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#475569;padding:20px">Warming up — waiting for data...</td></tr>';

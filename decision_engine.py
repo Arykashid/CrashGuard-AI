@@ -466,9 +466,11 @@ class DecisionEngine:
         )
 
         # ── Model transparency ─────────────────────────────────
-        prediction_disagreement = round(abs(raw_pred - corrected_pred), 2)
-        model_reliability       = round(1.0 - (prediction_disagreement / MAX_CPU), 4)
-        adjusted_conf           = round(confidence * (1.0 - prediction_disagreement / 100.0), 4)
+        # Normalize disagreement as ratio of current CPU — produces 0.02–0.25 range
+        _raw_disagree           = abs(raw_pred - corrected_pred)
+        prediction_disagreement = round(_raw_disagree / max(current_cpu, 1.0), 4)
+        model_reliability       = round(1.0 - min(prediction_disagreement, 1.0), 4)
+        adjusted_conf           = round(confidence * (1.0 - prediction_disagreement), 4)
 
         # ── Spike probability ──────────────────────────────────
         spike_prob = compute_spike_probability(
