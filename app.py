@@ -125,8 +125,8 @@ def api_status():
     Alert processing is now handled by background worker — not here.
     """
     try:
+        decisions   = engine.get_last_decisions()
         predictions = pipeline.get_predictions()
-        decisions   = engine.evaluate(predictions)
 
         servers = []
         for sid, d in decisions.items():
@@ -214,11 +214,37 @@ def api_servers():
 
 @app.route("/api/alerts")
 def api_alerts():
-    """FIX 3 — wrapped in try/except."""
+    """Returns active alerts from the Alert Registry."""
     try:
-        return jsonify(alerts.get_stats())
+        active_alerts = engine._alert_registry.get_all_active()
+        return jsonify(active_alerts)
     except Exception as e:
         logger.error(f"/api/alerts error: {e}")
+        return jsonify({"error": str(e), "status": "error"}), 500
+
+@app.route("/api/alerts/<alert_id>", methods=["PATCH"])
+def api_patch_alert(alert_id: str):
+    """Update alert lifecycle status (ACKNOWLEDGED, RESOLVED)."""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        new_status = data.get("status")
+        if not new_status:
+            return jsonify({"error": "status required"}), 400
+            
+        with engine._alert_registry._lock:
+            alert = engine._alert_registry._alerts.get(alert_id)
+            if not alert:
+                return jsonify({"error": "alert not found"}), 404
+                
+            alert["status"] = new_status
+            alert["history"].append({
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "state": alert["decision"],
+                "reason": f"Status updated to {new_status}"
+            })
+            return jsonify({"status": "ok", "alert": alert})
+    except Exception as e:
+        logger.error(f"/api/alerts PATCH error: {e}")
         return jsonify({"error": str(e), "status": "error"}), 500
 
 

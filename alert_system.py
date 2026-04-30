@@ -42,19 +42,19 @@ MAX_RETRIES        = 3     # FIX 2 — retry attempts
 RETRY_BASE_SECONDS = 1.0   # FIX 2 — exponential backoff base
 
 DECISION_EMOJI = {
-    "SCALE":    "📈",
-    "RESTART":  "🔄",
-    "ESCALATE": "🚨",
-    "MONITOR":  "👁",
-    "STABLE":   "✅",
+    "STABLE":      "✅",
+    "MONITOR":     "👀",
+    "SCALE_READY": "⏳",
+    "SCALE":       "📈",
+    "RESTART":     "🔁",
+    "ESCALATE":    "🚨",
 }
 
 SEVERITY_COLOR = {
     "CRITICAL": "#FF3B3B",
     "HIGH":     "#FF8C00",
-    "MEDIUM":   "#FFD700",
-    "LOW":      "#00BFFF",
-    "OK":       "#00C851",
+    "WARNING":  "#FFD700",
+    "INFO":     "#00BFFF",
 }
 
 # FIX 5 — pattern labels shown in Slack message

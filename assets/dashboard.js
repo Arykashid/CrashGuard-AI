@@ -49,28 +49,10 @@ function renderSparkline(serverId) {
 
 // ── OPERATOR ACTIONS ─────────────────────────────────────────────
 function getOperatorAction(s) {
-  const d = s.decision;
-  const cpu = s.current_cpu || 0;
-  const trend = s.trend || 'stable';
-  const spikes = s.spike_count || 0;
-
-  if (d === 'SCALE') {
-    if (cpu > 90) return { text: 'Scale pods +3 · Immediate', icon: '↑↑', cls: 'action-critical', color: '#ef4444' };
-    return { text: 'Scale pods +2 · Priority: high', icon: '↑', cls: 'action-critical', color: '#ef4444' };
-  }
-  if (d === 'ESCALATE') {
-    return { text: 'Page on-call · SLA breach ~5min', icon: '📟', cls: 'action-critical', color: '#f97316' };
-  }
-  if (d === 'RESTART') {
-    if (spikes > 5) return { text: 'Restart + drain connections', icon: '🔄', cls: 'action-warn', color: '#f97316' };
-    return { text: 'Graceful restart · PID recycle', icon: '🔄', cls: 'action-warn', color: '#eab308' };
-  }
-  if (d === 'MONITOR') {
-    if (trend === 'rising' || trend === 'rapidly_rising')
-      return { text: 'Watch · Pre-warm standby', icon: '👁', cls: 'action-watch', color: '#3b82f6' };
-    return { text: 'Watch · Next eval in 30s', icon: '👁', cls: 'action-watch', color: '#94a3b8' };
-  }
-  return { text: 'No action required', icon: '—', cls: 'action-ok', color: '#94a3b8' };
+  // Use authoritative backend action strings instead of duplicating logic on frontend
+  const color = s.severity === 'CRITICAL' ? '#ef4444' : s.severity === 'HIGH' ? '#f97316' : s.severity === 'MEDIUM' ? '#eab308' : '#22c55e';
+  const icon = DC[s.decision] ? DC[s.decision].icon : '—';
+  return { text: s.action || 'No action required', icon: icon, cls: 'action-' + s.severity.toLowerCase(), color: color };
 }
 
 // ── PAGE NAVIGATION ────────────────────────────────────────────
@@ -177,10 +159,14 @@ Chart.register({
 // ── FETCH ──────────────────────────────────────────────────────
 async function fetchStatus() {
   try {
-    const r = await fetch('/api/status');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const d = await r.json();
-    processData(d);
+    const [rStat, rAlerts] = await Promise.all([
+      fetch('/api/status'),
+      fetch('/api/alerts')
+    ]);
+    if (!rStat.ok || !rAlerts.ok) throw new Error('HTTP Error');
+    const data = await rStat.json();
+    data.alerts = await rAlerts.json();
+    processData(data);
     setConn(true);
   } catch (e) { setConn(false); }
 }
@@ -220,29 +206,48 @@ function processData(data) {
 
     if (s.severity === 'CRITICAL' || s.severity === 'HIGH') critCount++;
 
-    // DEDUP FIX — use backend alert_ready instead of naive state-change detection
-    if (s.alert_ready && s.model_used !== 'warming_up') {
-      addIncident(s, now);
-      S.decisionCount++;
-      const shLi = document.getElementById('sh-last-intervention');
-      if (shLi) shLi.textContent = s.server_name.split('—')[0].trim() + ' ' + s.decision;
-      S.alertLog.unshift({
-        ts: now.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' }),
-        server: s.server_name.split('—')[0].trim(),
-        decision: s.decision,
-        severity: s.severity,
-        cpu: s.current_cpu,
-        reason: s.reason || '',
-        incident_id: s.incident_id || null,
-        transition: s.incident_transition || null,
-      });
-      if (S.alertLog.length > 50) S.alertLog.pop();
-      S.alertCount++;
-    }
+    // Remove old frontend-based incident computation
+    // Alert Registry is the SINGLE SOURCE OF TRUTH
 
     const p = PRIORITY[s.decision] || 0;
     if (p > worstPriority) { worstPriority = p; worstServer = s; }
   });
+
+  // Load from backend Alert Registry
+  S.alertLog = (data.alerts || []).map(alert => {
+    const timestamp = alert.timestamp || new Date().toISOString();
+    return {
+      id: alert.id,
+      timestamp: timestamp,
+      ts: new Date(timestamp).toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      server: alert.server_id || 'UNKNOWN',
+      decision: alert.decision,
+      cpu: alert.cpu !== undefined ? alert.cpu : 0.0,
+      predicted_cpu: alert.predicted_cpu !== undefined ? alert.predicted_cpu : 0.0,
+      crash_risk: alert.risk !== undefined ? alert.risk : 0.0,
+      confidence: alert.confidence !== undefined ? alert.confidence : 0.0,
+      spikes: alert.evidence?.spikes !== undefined ? alert.evidence.spikes : 0,
+      severity: alert.severity,
+      status: alert.status,
+      evidence: alert.evidence || { spikes: 0, trend: 'unknown', thresholds: [] },
+      reason: alert.reason || ''
+    };
+  }).filter(alert => {
+    // 8. ADD VALIDATION LAYER (CRITICAL)
+    return (
+      alert.timestamp &&
+      alert.cpu !== undefined &&
+      alert.predicted_cpu !== undefined &&
+      alert.crash_risk !== undefined &&
+      alert.confidence !== undefined
+    );
+  }).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  S.alertCount = S.alertLog.length;
+  
+  if (critCount > 0 && S.alertLog.length === 0) {
+    throw new Error("Inconsistent alert state — registry failure");
+  }
 
   if (worstServer) updateHero(worstServer);
   renderServers(servers);
@@ -435,8 +440,10 @@ function renderSystemsPage() {
     const pct = Math.min(s.current_cpu, 100);
     const TDISPLAY = { rapidly_rising: '📈 Rising fast', rising: '↗ Rising', stable: '→ Stable', falling: '↘ Falling', rapidly_falling: '📉 Falling fast', volatile: '⚡ Volatile', elevated: '↑ Elevated' };
     let trendStr = s.trend ? (TDISPLAY[s.trend] || s.trend) : '—';
+    const riskScore = s.risk_score || 0;
+    const riskBadge = riskScore > 0.8 ? `<span style="font-size:10px;color:var(--red);margin-left:8px;border:1px solid rgba(239,68,68,0.4);border-radius:3px;padding:2px 4px;background:rgba(239,68,68,0.1);font-weight:600;">CRITICAL RISK</span>` : '';
     return `<tr>
-      <td><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:7px;height:7px;border-radius:50%;background:${dc.color};display:inline-block"></span>${s.server_name}</span></td>
+      <td><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:7px;height:7px;border-radius:50%;background:${dc.color};display:inline-block"></span>${s.server_name}${riskBadge}</span></td>
       <td>
         <div style="display:flex;align-items:center;gap:8px">
           <div style="flex:1;height:5px;background:var(--surface3);border-radius:3px;overflow:hidden"><div style="width:${pct}%;height:100%;background:${barColor};border-radius:3px"></div></div>
@@ -465,11 +472,14 @@ function renderAlertsPage() {
   if (dedupEl && S.metrics) {
       const suppressed = S.metrics.alerts_suppressed || 0;
       const total = suppressed + (S.metrics.interventions || 0);
-      dedupEl.textContent = `${suppressed} / ${total}`;
+      const ratio = S.metrics.dedup_ratio || 0;
+      dedupEl.textContent = ratio + '%';
+      dedupEl.nextElementSibling.textContent = `${suppressed} of ${total} alerts suppressed`;
   }
 
-  if (S.alertLog.length === 0) {
-    el.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:20px">No incidents detected — system operating within normal parameters</td></tr>';
+  // ALERT DATA GUARD
+  if (!S.alertLog || S.alertLog.length === 0) {
+    el.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:20px">No alerts found</td></tr>';
     return;
   }
 
@@ -494,6 +504,13 @@ function renderAlertsPage() {
     const liveServer = Object.values(S.servers).find(
       sv => (sv.server_name || '').split('—')[0].trim() === a.server
     );
+    
+    // SAFE ACCESS AND INITIALIZATION
+    const activeDecision = liveServer?.decision || a?.decision || "UNKNOWN";
+    
+    // DEBUG LOGGING
+    console.log("ACTIVE DECISION:", activeDecision);
+    console.log("ALERTS:", S.alertLog);
 
     // Build the incident investigation panel
     let drillDown = '';
@@ -502,21 +519,19 @@ function renderAlertsPage() {
       const serverAlerts = S.alertLog.filter(al => al.server === a.server).slice(0, 6);
       const timelineHtml = serverAlerts.map(al => {
         const sc = SEV[al.severity] || SEV.LOW;
+        const riskPct = Math.round(al.crash_risk * 100) || 0;
         return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.03);">
-          <span style="font-family:var(--mono);font-size:10px;color:var(--text3);min-width:42px;">${al.ts}</span>
-          <span style="width:6px;height:6px;border-radius:50%;background:${sc.color};flex-shrink:0;"></span>
-          <span style="font-size:11px;font-weight:600;color:${sc.color};min-width:65px;">${al.decision}</span>
-          <span style="font-family:var(--mono);font-size:10px;color:var(--text2);">${al.cpu?.toFixed(1) || '?'}%</span>
+          <span style="font-family:var(--mono);font-size:10px;color:var(--text3);min-width:42px;">${al.ts} — ${al.server} — ${al.decision} — ${al.cpu.toFixed(1)}% CPU — Risk ${riskPct}%</span>
         </div>`;
       }).join('');
 
-      // Evidence from live server state
-      const cpu = liveServer ? liveServer.current_cpu : a.cpu || 0;
-      const pred = liveServer ? liveServer.predicted_cpu : 0;
-      const trend = liveServer ? liveServer.trend : 'unknown';
-      const spikes = liveServer ? liveServer.spike_count : 0;
-      const cr = liveServer ? ((liveServer.crash_risk_5min || liveServer.spike_probability || 0) * 100).toFixed(0) : '—';
-      const conf = liveServer ? (((liveServer.adjusted_confidence || liveServer.confidence || 0)) * 100).toFixed(0) : '—';
+      // Evidence from SNAPSHOT (No liveServer fallbacks for historical alerts)
+      const cpu = a.cpu;
+      const pred = a.predicted_cpu;
+      const trend = a.evidence?.trend || 'unknown';
+      const spikes = a.spikes;
+      const cr = Math.round(a.crash_risk * 100);
+      const conf = Math.round(a.confidence * 100);
 
       // Threshold analysis
       const thresholds = [];
@@ -528,18 +543,11 @@ function renderAlertsPage() {
       if (thresholds.length === 0) thresholds.push('Below all action thresholds');
 
       // SRE-actionable command
-      const CMD = {
-        SCALE: 'kubectl autoscale deployment/api-server --cpu-percent=70 --min=3 --max=8',
-        ESCALATE: 'pagerduty trigger --severity=critical --service=crashguard --message="sustained instability"',
-        RESTART: 'kubectl rollout restart deployment/api-server && kubectl rollout status deployment/api-server',
-        MONITOR: 'kubectl top pods -n production --sort-by=cpu | head -10',
-        STABLE: '# No action required — system nominal',
-      };
-      const cmd = CMD[a.decision] || CMD.STABLE;
+      const cmd = liveServer?.action || a.reason || 'System nominal';
 
       // Escalation path visualization
       const levels = ['STABLE', 'MONITOR', 'RESTART', 'SCALE', 'ESCALATE'];
-      const currentIdx = levels.indexOf(a.decision);
+      const currentIdx = levels.indexOf(activeDecision);
       const escPath = levels.map((l, i) => {
         const active = i === currentIdx;
         const past = i < currentIdx;
@@ -561,7 +569,7 @@ function renderAlertsPage() {
                 <li>CPU: ${cpu.toFixed ? cpu.toFixed(1) : cpu}% (${trend})</li>
                 <li>Predicted: ${pred.toFixed ? pred.toFixed(1) : pred}%</li>
                 <li>Crash risk: ${cr}%</li>
-                <li>Confidence: ${conf}%${conf !== '—' ? (conf > 70 ? ' ✅ auto-gate passed' : conf > 50 ? ' ⚠ monitor-only gate' : ' 🔴 human escalation required') : ''}</li>
+                <li>Confidence: ${conf}%</li>
                 <li>Spike count: ${spikes}</li>
               </ul>
               <div class="pred-reason-label" style="margin-top:8px;">Thresholds Crossed</div>
@@ -578,9 +586,9 @@ function renderAlertsPage() {
                 If SCALE fails → Trigger human escalation (PagerDuty)<br>
                 If false positive → Suppress intervention for 5m
               </div>
-              <div class="pred-reason-label" style="margin-top:10px;">Recommended Command</div>
+              <div class="pred-reason-label" style="margin-top:10px;">System Action</div>
               <div style="margin-top:4px;padding:6px 8px;background:rgba(0,0,0,0.3);border-radius:4px;font-size:10.5px;font-family:var(--mono);color:var(--cyan);line-height:1.5;word-break:break-all;">
-                $ ${cmd}
+                ${cmd}
               </div>
               <div class="pred-reason-label" style="margin-top:10px;">Root Cause Hypothesis</div>
               <div style="margin-top:4px;font-size:11px;color:var(--text2);line-height:1.5;">${a.reason || 'Insufficient data for root cause analysis'}</div>
@@ -598,7 +606,7 @@ function renderAlertsPage() {
     return `<tr class="alert-drill-toggle" onclick="toggleAlertRow(${idx})" style="cursor:pointer;background:${s.rowBg};border-bottom:${expanded ? 'none' : '1px solid rgba(255,255,255,0.06)'}">
       <td style="font-family:var(--mono);font-size:11px;color:var(--text3)"><span class="expand-chevron">${chevron}</span>${a.ts}</td>
       <td style="font-weight:600">${a.server}</td>
-      <td><span style="font-size:11px;font-family:var(--mono);color:var(--text2)">${a.decision}</span></td>
+      <td><span style="font-size:11px;font-family:var(--mono);color:var(--text2)">${activeDecision}</span></td>
       <td style="font-family:var(--mono);font-size:11px;color:${a.cpu > 80 ? '#ef4444' : a.cpu > 60 ? '#f97316' : '#94a3b8'}">${a.cpu?.toFixed(1) || '—'}%</td>
       <td><span style="font-size:10px;font-weight:700;padding:3px 10px;border-radius:4px;background:${s.bg};color:${s.color};border:1px solid ${s.color}40">${a.severity}</span></td>
       <td style="font-size:11px;color:var(--text2);max-width:260px;line-height:1.4" title="${a.reason || ''}">${reasonSnip}</td>
@@ -700,7 +708,7 @@ function renderModelsPage() {
         if (modelsPage) modelsPage.insertBefore(trustBannerEl, modelsPage.firstChild);
       }
       const failNames = indicators.filter(i => i.fail).map(i => i.name).join(', ');
-      trustBannerEl.innerHTML = `<span style="font-weight:700;">⚠ DEGRADED TRUST MODE</span> — ${failNames} outside safe operating range. Autonomous decisions gated to MONITOR until recovery.`;
+      trustBannerEl.innerHTML = `<span style="font-weight:700;">⚠ DEGRADED TRUST MODE</span> — ${failNames} outside safe operating range. Autonomous decisions gated to MONITOR until recovery. (Emergency override active for CPU &gt; 85%).`;
       trustBannerEl.style.display = 'block';
     } else if (trustBannerEl) {
       trustBannerEl.style.display = 'none';
