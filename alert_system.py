@@ -1,32 +1,29 @@
 """
-alert_system.py — CrashGuard AI
-Sends rich Slack block alerts for HIGH and CRITICAL decisions.
+alert_system.py — CrashGuard AI (Production Grade)
+Unified alert engine: Slack + Email + Cooldown + Layered Fallback.
 
-Features:
-  - Rich Slack blocks (not plain text)
-  - Server name, current CPU, predicted CPU
-  - Confidence, decision, root cause, action
-  - Dynamic insights: trend direction + pattern type
-  - 5 minute cooldown per server independently
-  - Only fires for HIGH and CRITICAL severity
-  - Retry with exponential backoff (3 attempts)
-  - Async send — never blocks the main thread
-  - Graceful fallback if Slack not configured
+Alerts are DERIVED from DecisionEngine output — zero independent logic.
 
-Fixes applied:
-  [2] Retry with exponential backoff (3 attempts, 1s/2s/4s)
-  [3] Slack send runs in background thread — non-blocking
-  [5] Dynamic insights: trend direction + pattern type in message
-  [7] Removed unused variables (header, subtext)
+Delivery architecture:
+  try: send_slack()
+  except: send_email()
+  else: log_dry_run()
+
+Email triggers ONLY on ESCALATE decisions.
+Cooldown: 120s per server per channel.
 """
 
 import os
 import json
 import time
+import uuid
 import logging
 import threading
+import smtplib
 import urllib.request
 import urllib.error
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -35,18 +32,34 @@ logger = logging.getLogger("crashguard.alerts")
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-SLACK_WEBHOOK_URL  = os.getenv("SLACK_WEBHOOK_URL", "")
-ALERT_COOLDOWN     = 300   # 5 minutes per server
-ALERTABLE_SEVERITY = {"CRITICAL", "HIGH"}
-MAX_RETRIES        = 3     # FIX 2 — retry attempts
-RETRY_BASE_SECONDS = 1.0   # FIX 2 — exponential backoff base
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+
+# Email config — Gmail App Password
+SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER     = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")  # Gmail App Password
+EMAIL_TO      = os.getenv("ALERT_EMAIL_TO", "")
+
+ALERT_COOLDOWN_SLACK = 120  # seconds per server
+ALERT_COOLDOWN_EMAIL = 120  # seconds per server
+MAX_RETRIES          = 3
+RETRY_BASE_SECONDS   = 1.0
+
+# Severity mapping — SINGLE SOURCE from decision engine
+SEVERITY_MAP = {
+    "ESCALATE":    "CRITICAL",
+    "SCALE":       "HIGH",
+    "SCALE_READY": "WARNING",
+    "MONITOR":     "WARNING",
+    "STABLE":      "INFO",
+}
 
 DECISION_EMOJI = {
     "STABLE":      "✅",
     "MONITOR":     "👀",
     "SCALE_READY": "⏳",
     "SCALE":       "📈",
-    "RESTART":     "🔁",
     "ESCALATE":    "🚨",
 }
 
@@ -57,23 +70,19 @@ SEVERITY_COLOR = {
     "INFO":     "#00BFFF",
 }
 
-# FIX 5 — pattern labels shown in Slack message
-BEHAVIOR_LABEL = {
-    "stable":      "Stable baseline",
-    "gradual":     "Gradual climb",
-    "burst":       "Sudden burst",
-    "fluctuating": "Oscillating load",
-    "critical":    "Sustained high load",
-    "demo_trigger":"Manual trigger",
-}
+# Only fire Slack/email for these
+ALERTABLE_DECISIONS = {"ESCALATE", "SCALE"}
+EMAIL_DECISIONS     = {"ESCALATE"}
 
 
 # ─────────────────────────────────────────────
-# COOLDOWN TRACKER
+# COOLDOWN TRACKER (per-channel, per-server)
 # ─────────────────────────────────────────────
 
-class AlertCooldown:
-    def __init__(self, cooldown_seconds: int = ALERT_COOLDOWN):
+class ChannelCooldown:
+    """Per-server cooldown tracker for a single delivery channel."""
+
+    def __init__(self, cooldown_seconds: int):
         self._lock     = threading.Lock()
         self._cooldown = cooldown_seconds
         self._last: dict[str, float] = {}
@@ -93,77 +102,43 @@ class AlertCooldown:
 
 
 # ─────────────────────────────────────────────
-# FIX 5 — DYNAMIC INSIGHT BUILDER
+# STRUCTURED ALERT BUILDER
 # ─────────────────────────────────────────────
 
-def _trend_direction(delta_1: float, delta_5: float) -> str:
-    """Derive trend label from delta features."""
-    if delta_1 > 3.0 and delta_5 > 5.0:
-        return "📈 Rapidly rising"
-    elif delta_1 > 1.0:
-        return "↗ Rising"
-    elif delta_1 < -3.0 and delta_5 < -5.0:
-        return "📉 Rapidly falling"
-    elif delta_1 < -1.0:
-        return "↘ Falling"
-    else:
-        return "→ Stable"
-
-
-def _confidence_label(confidence: float) -> str:
-    if confidence >= 0.85:
-        return "Very high — model is certain"
-    elif confidence >= 0.70:
-        return "High — reliable prediction"
-    elif confidence >= 0.50:
-        return "Moderate — monitor closely"
-    else:
-        return "Low — treat as indicative"
-
-
-def build_dynamic_insights(decision: dict) -> str:
+def build_structured_alert(decision: dict) -> dict:
     """
-    FIX 5 — Build dynamic insight string for Slack message.
-    Shows trend direction, pattern type, confidence interpretation.
+    Build canonical alert from decision engine output.
+    This is the SINGLE alert format used everywhere.
     """
-    features = decision.get("features", {})
-    delta_1  = features.get("delta_1", 0.0)
-    delta_5  = features.get("delta_5", 0.0)
-    behavior = decision.get("behavior", "")
-
-    trend    = _trend_direction(delta_1, delta_5)
-    pattern  = BEHAVIOR_LABEL.get(behavior, "Unknown pattern")
-    conf_lbl = _confidence_label(decision.get("confidence", 0.0))
-
-    return (
-        f"*Trend:* {trend}\n"
-        f"*Pattern:* {pattern}\n"
-        f"*Confidence:* {conf_lbl}"
-    )
+    dec = decision.get("decision", "STABLE")
+    return {
+        "id":            str(uuid.uuid4()),
+        "timestamp":     decision.get("timestamp", datetime.now(timezone.utc).isoformat()),
+        "server_id":     decision.get("server_id", ""),
+        "server_name":   decision.get("server_name", ""),
+        "decision":      dec,
+        "severity":      SEVERITY_MAP.get(dec, "INFO"),
+        "cpu":           round(float(decision.get("current_cpu", 0)), 2),
+        "predicted_cpu": round(float(decision.get("predicted_cpu", 0)), 2),
+        "risk":          round(float(decision.get("crash_risk_5min", decision.get("risk_score", 0))), 4),
+        "trend":         decision.get("trend", "stable"),
+        "reason":        decision.get("reason", ""),
+        "action":        decision.get("action", ""),
+        "confidence":    round(float(decision.get("confidence", 0)), 4),
+        "spike_count":   int(decision.get("spike_count", 0)),
+    }
 
 
 # ─────────────────────────────────────────────
 # SLACK MESSAGE BUILDER
 # ─────────────────────────────────────────────
 
-def build_slack_blocks(decision: dict) -> dict:
-    server      = decision["server_name"]
-    curr_cpu    = decision["current_cpu"]
-    pred_cpu    = decision["predicted_cpu"]
-    confidence  = decision["confidence"]
-    dec         = decision["decision"]
-    severity    = decision["severity"]
-    reason      = decision["reason"]
-    action      = decision["action"]
-    spike_count = decision["spike_count"]
-    spike_prob  = decision.get("spike_probability", 0.0)
-    model_used  = decision.get("model_used", "ensemble")
-    ts          = decision["timestamp"]
-    emoji       = DECISION_EMOJI.get(dec, "⚠️")
-    color       = SEVERITY_COLOR.get(severity, "#888888")
-
-    # FIX 5 — dynamic insights block
-    insights = build_dynamic_insights(decision)
+def build_slack_blocks(alert: dict) -> dict:
+    """Build Slack block kit payload from structured alert."""
+    dec      = alert["decision"]
+    severity = alert["severity"]
+    emoji    = DECISION_EMOJI.get(dec, "⚠️")
+    color    = SEVERITY_COLOR.get(severity, "#888888")
 
     blocks = [
         {
@@ -178,161 +153,233 @@ def build_slack_blocks(decision: dict) -> dict:
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"{emoji} *{server}*\nSeverity: *{severity}*"
+                "text": f"{emoji} *{alert['server_name']}*\nSeverity: *{severity}*"
             }
         },
         {"type": "divider"},
         {
             "type": "section",
             "fields": [
-                {"type": "mrkdwn", "text": f"*Current CPU*\n`{curr_cpu:.1f}%`"},
-                {"type": "mrkdwn", "text": f"*Predicted CPU*\n`{pred_cpu:.1f}%`"},
-                {"type": "mrkdwn", "text": f"*Confidence*\n`{confidence:.0%}`"},
-                {"type": "mrkdwn", "text": f"*Spike Probability*\n`{spike_prob:.0%}`"},
-                {"type": "mrkdwn", "text": f"*Spikes (10 min)*\n`{spike_count}`"},
-                {"type": "mrkdwn", "text": f"*Model*\n`{model_used}`"},
+                {"type": "mrkdwn", "text": f"*Current CPU*\n`{alert['cpu']:.1f}%`"},
+                {"type": "mrkdwn", "text": f"*Predicted CPU*\n`{alert['predicted_cpu']:.1f}%`"},
+                {"type": "mrkdwn", "text": f"*Risk*\n`{alert['risk']:.0%}`"},
+                {"type": "mrkdwn", "text": f"*Trend*\n`{alert['trend']}`"},
+                {"type": "mrkdwn", "text": f"*Confidence*\n`{alert['confidence']:.0%}`"},
+                {"type": "mrkdwn", "text": f"*Spikes (10 min)*\n`{alert['spike_count']}`"},
             ]
         },
         {"type": "divider"},
-        # FIX 5 — dynamic insights section
         {
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Dynamic Insights*\n{insights}"
-            }
-        },
-        {"type": "divider"},
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Root Cause*\n{reason}"
-            }
+            "text": {"type": "mrkdwn", "text": f"*Root Cause*\n{alert['reason']}"}
         },
         {
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Autonomous Action*\n⚙ {action}"
-            }
+            "text": {"type": "mrkdwn", "text": f"*Autonomous Action*\n⚙ {alert['action']}"}
         },
         {"type": "divider"},
         {
             "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"🤖 CrashGuard AI  |  {ts}  |  "
-                        "Powered by LSTM + XGBoost Ensemble"
-                    )
-                }
-            ]
+            "elements": [{
+                "type": "mrkdwn",
+                "text": f"🤖 CrashGuard AI  |  {alert['timestamp']}  |  LSTM + XGBoost Ensemble"
+            }]
         }
     ]
 
-    return {
-        "attachments": [
-            {
-                "color":  color,
-                "blocks": blocks,
-            }
-        ]
-    }
+    return {"attachments": [{"color": color, "blocks": blocks}]}
 
 
 # ─────────────────────────────────────────────
-# ALERT SENDER
+# EMAIL BUILDER
+# ─────────────────────────────────────────────
+
+def build_email(alert: dict) -> MIMEMultipart:
+    """Build MIME email for ESCALATE alerts."""
+    subject = f"[CRITICAL] CrashGuard — {alert['server_name']} Escalation"
+
+    body = f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🚨 CRASHGUARD AI — CRITICAL ESCALATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Server:        {alert['server_name']} ({alert['server_id']})
+Decision:      {alert['decision']}
+Severity:      {alert['severity']}
+
+Current CPU:   {alert['cpu']:.1f}%
+Predicted CPU: {alert['predicted_cpu']:.1f}%
+Crash Risk:    {alert['risk']:.0%}
+Trend:         {alert['trend']}
+
+Root Cause:
+{alert['reason']}
+
+Action:
+{alert['action']}
+
+Timestamp: {alert['timestamp']}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This alert was generated by CrashGuard AI.
+Automated SRE — LSTM + XGBoost Ensemble
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    msg["From"]    = SMTP_USER
+    msg["To"]      = EMAIL_TO
+    msg.attach(MIMEText(body, "plain"))
+    return msg
+
+
+# ─────────────────────────────────────────────
+# ALERT SYSTEM — UNIFIED DELIVERY ENGINE
 # ─────────────────────────────────────────────
 
 class AlertSystem:
+    """
+    Production alert system with layered delivery.
+    
+    Pipeline:
+      DecisionEngine output → build_structured_alert()
+      → cooldown check → try Slack → except email → else dry-run log
+    
+    Email fires ONLY on ESCALATE. Slack fires on ESCALATE + SCALE.
+    """
 
-    def __init__(self, webhook_url: str = SLACK_WEBHOOK_URL):
-        self._webhook    = webhook_url
-        self._cooldown   = AlertCooldown()
-        self._enabled    = bool(webhook_url)
-        self._lock       = threading.Lock()
-        self._sent_count = 0
-        self._fail_count = 0
+    def __init__(self):
+        self._slack_webhook   = SLACK_WEBHOOK_URL
+        self._slack_enabled   = bool(SLACK_WEBHOOK_URL)
+        self._email_enabled   = bool(SMTP_USER and SMTP_PASSWORD and EMAIL_TO)
+        self._slack_cooldown  = ChannelCooldown(ALERT_COOLDOWN_SLACK)
+        self._email_cooldown  = ChannelCooldown(ALERT_COOLDOWN_EMAIL)
+        self._lock            = threading.Lock()
+        self._sent_count      = 0
+        self._fail_count      = 0
+        self._email_sent      = 0
+        self._dry_run_count   = 0
+        self._alert_log: list[dict] = []
 
-        if self._enabled:
-            logger.info("Alert system ready — Slack webhook configured.")
+        if self._slack_enabled:
+            logger.info("Alert system: Slack webhook configured.")
         else:
-            logger.warning(
-                "Alert system in DRY-RUN mode — "
-                "set SLACK_WEBHOOK_URL to enable real alerts."
-            )
+            logger.warning("Alert system: No Slack webhook — will attempt email fallback.")
+
+        if self._email_enabled:
+            logger.info(f"Alert system: Email configured ({SMTP_USER} → {EMAIL_TO}).")
+        else:
+            logger.warning("Alert system: No email configured — set SMTP_USER/SMTP_PASSWORD/ALERT_EMAIL_TO.")
 
     def process_decisions(self, decisions: dict[str, dict]) -> list[dict]:
-        sent = []
+        """Process all decisions from engine. Returns list of fired alerts."""
+        fired = []
         for sid, decision in decisions.items():
-            result = self._maybe_send(sid, decision)
+            result = self._process_one(sid, decision)
             if result:
-                sent.append(result)
-        return sent
+                fired.append(result)
+        return fired
 
-    def _maybe_send(self, server_id: str, decision: dict) -> Optional[dict]:
-        severity = decision.get("severity", "OK")
-        if severity not in ALERTABLE_SEVERITY:
+    def _process_one(self, server_id: str, decision: dict) -> Optional[dict]:
+        """Process single decision through alert pipeline."""
+        dec = decision.get("decision", "STABLE")
+
+        # Only alert on actionable decisions
+        if dec not in ALERTABLE_DECISIONS:
             return None
-        if not self._cooldown.can_send(server_id):
-            remaining = self._cooldown.seconds_remaining(server_id)
+
+        alert = build_structured_alert(decision)
+
+        # ── LAYERED DELIVERY ──────────────────────────────
+        slack_sent = False
+        email_sent = False
+        dry_run    = False
+
+        # Layer 1: Try Slack
+        if dec in ALERTABLE_DECISIONS and self._slack_cooldown.can_send(server_id):
+            if self._slack_enabled:
+                try:
+                    self._send_slack_async(alert)
+                    self._slack_cooldown.mark_sent(server_id)
+                    slack_sent = True
+                except Exception as e:
+                    logger.error(f"Slack send failed for {server_id}: {e}")
+                    # Fall through to email
+            
+            # Layer 2: Email fallback (or primary for ESCALATE)
+            if (not slack_sent or dec in EMAIL_DECISIONS) and dec in EMAIL_DECISIONS:
+                if self._email_enabled and self._email_cooldown.can_send(server_id):
+                    try:
+                        self._send_email_async(alert)
+                        self._email_cooldown.mark_sent(server_id)
+                        email_sent = True
+                    except Exception as e:
+                        logger.error(f"Email send failed for {server_id}: {e}")
+
+            # Layer 3: Dry-run log if nothing sent
+            if not slack_sent and not email_sent:
+                self._dry_run_log(alert)
+                dry_run = True
+        else:
+            # Cooldown active
+            remaining = self._slack_cooldown.seconds_remaining(server_id)
             logger.debug(f"Alert suppressed for {server_id} — cooldown {remaining}s")
             return None
 
-        payload = build_slack_blocks(decision)
-        self._cooldown.mark_sent(server_id)
-
-        if self._enabled:
-            # FIX 3 — send in background thread, never blocks main thread
-            t = threading.Thread(
-                target=self._send_with_retry,
-                args=(payload,),
-                daemon=True,
-            )
-            t.start()
-        else:
-            self._dry_run_log(decision)
-
         with self._lock:
             self._sent_count += 1
+            if dry_run:
+                self._dry_run_count += 1
+            self._alert_log.append(alert)
+            # Cap log at 500 entries
+            if len(self._alert_log) > 500:
+                self._alert_log = self._alert_log[-500:]
 
         return {
-            "server_id": server_id,
-            "decision":  decision["decision"],
-            "severity":  severity,
-            "sent":      True,
-            "dry_run":   not self._enabled,
-            "timestamp": decision["timestamp"],
+            "alert_id":   alert["id"],
+            "server_id":  server_id,
+            "decision":   dec,
+            "severity":   alert["severity"],
+            "slack_sent":  slack_sent,
+            "email_sent":  email_sent,
+            "dry_run":     dry_run,
+            "timestamp":   alert["timestamp"],
         }
 
-    def _send_with_retry(self, payload: dict):
-        """
-        FIX 2 — Retry with exponential backoff.
-        Attempts: 1s → 2s → 4s between retries.
-        """
+    # ── SLACK DELIVERY ──────────────────────────────────
+
+    def _send_slack_async(self, alert: dict):
+        payload = build_slack_blocks(alert)
+        t = threading.Thread(
+            target=self._send_slack_with_retry,
+            args=(payload, alert["server_id"]),
+            daemon=True,
+        )
+        t.start()
+
+    def _send_slack_with_retry(self, payload: dict, server_id: str):
         for attempt in range(1, MAX_RETRIES + 1):
             success = self._send_to_slack(payload)
             if success:
+                with self._lock:
+                    self._sent_count += 1
+                logger.info(f"Slack alert sent for {server_id}")
                 return
             if attempt < MAX_RETRIES:
                 wait = RETRY_BASE_SECONDS * (2 ** (attempt - 1))
-                logger.warning(
-                    f"Slack send failed (attempt {attempt}/{MAX_RETRIES}) "
-                    f"— retrying in {wait:.0f}s"
-                )
+                logger.warning(f"Slack failed (attempt {attempt}/{MAX_RETRIES}) — retry in {wait:.0f}s")
                 time.sleep(wait)
             else:
-                logger.error(f"Slack send failed after {MAX_RETRIES} attempts.")
+                logger.error(f"Slack failed after {MAX_RETRIES} attempts for {server_id}")
                 with self._lock:
                     self._fail_count += 1
 
     def _send_to_slack(self, payload: dict) -> bool:
         try:
             data = json.dumps(payload).encode("utf-8")
-            req  = urllib.request.Request(
-                self._webhook,
+            req = urllib.request.Request(
+                self._slack_webhook,
                 data=data,
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -343,37 +390,83 @@ class AlertSystem:
             logger.error(f"Slack request error: {e}")
             return False
 
-    def _dry_run_log(self, decision: dict):
-        features = decision.get("features", {})
-        delta_1  = features.get("delta_1", 0.0)
-        delta_5  = features.get("delta_5", 0.0)
-        trend    = _trend_direction(delta_1, delta_5)
-        logger.info(
-            f"[DRY-RUN] {decision['server_name']} | "
-            f"{decision['decision']} | "
-            f"CPU={decision['current_cpu']:.1f}% | "
-            f"PRED={decision['predicted_cpu']:.1f}% | "
-            f"Trend={trend} | "
-            f"{decision['reason']}"
+    # ── EMAIL DELIVERY ──────────────────────────────────
+
+    def _send_email_async(self, alert: dict):
+        t = threading.Thread(
+            target=self._send_email_with_retry,
+            args=(alert,),
+            daemon=True,
         )
+        t.start()
+
+    def _send_email_with_retry(self, alert: dict):
+        for attempt in range(1, MAX_RETRIES + 1):
+            success = self._send_email(alert)
+            if success:
+                with self._lock:
+                    self._email_sent += 1
+                logger.info(f"Email alert sent for {alert['server_id']}")
+                return
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                logger.warning(f"Email failed (attempt {attempt}/{MAX_RETRIES}) — retry in {wait:.0f}s")
+                time.sleep(wait)
+            else:
+                logger.error(f"Email failed after {MAX_RETRIES} attempts for {alert['server_id']}")
+                with self._lock:
+                    self._fail_count += 1
+
+    def _send_email(self, alert: dict) -> bool:
+        try:
+            msg = build_email(alert)
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.send_message(msg)
+            return True
+        except Exception as e:
+            logger.error(f"SMTP error: {e}")
+            return False
+
+    # ── DRY-RUN FALLBACK ────────────────────────────────
+
+    def _dry_run_log(self, alert: dict):
+        logger.info(
+            f"[DRY-RUN] {alert['server_name']} | "
+            f"{alert['decision']} ({alert['severity']}) | "
+            f"CPU={alert['cpu']:.1f}% | "
+            f"PRED={alert['predicted_cpu']:.1f}% | "
+            f"Risk={alert['risk']:.0%} | "
+            f"Trend={alert['trend']} | "
+            f"{alert['reason'][:120]}"
+        )
+
+    # ── STATS ───────────────────────────────────────────
 
     def get_stats(self) -> dict:
         with self._lock:
             return {
-                "sent":    self._sent_count,
-                "failed":  self._fail_count,
-                "enabled": self._enabled,
+                "slack_sent":    self._sent_count,
+                "email_sent":    self._email_sent,
+                "failed":        self._fail_count,
+                "dry_runs":      self._dry_run_count,
+                "slack_enabled": self._slack_enabled,
+                "email_enabled": self._email_enabled,
+                "total_alerts":  len(self._alert_log),
             }
 
+    def get_alert_log(self) -> list[dict]:
+        with self._lock:
+            return list(self._alert_log)
+
 
 # ─────────────────────────────────────────────
-# STANDALONE TEST — python alert_system.py
+# STANDALONE TEST
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    import server_simulator as sim
-    from pipeline import PredictionPipeline
-    from decision_engine import DecisionEngine
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -383,59 +476,34 @@ if __name__ == "__main__":
     print("CrashGuard AI — Alert System Test")
     print("─" * 55)
 
-    webhook = os.getenv("SLACK_WEBHOOK_URL", "")
-    if webhook:
-        print("✅ Slack webhook configured — real alerts will fire")
-    else:
-        print("⚠️  No SLACK_WEBHOOK_URL — running in dry-run mode")
-    print()
-
-    sim.start()
-    pipeline = PredictionPipeline()
-    pipeline.start()
-    engine   = DecisionEngine()
-    alerts   = AlertSystem()
-
-    print("Warming up (90s)...\n")
-    time.sleep(90)
-
-    for cycle in range(8):
-        time.sleep(4)
-        predictions = pipeline.get_predictions()
-        if not predictions:
-            continue
-
-        decisions = engine.evaluate(predictions)
-        sent      = alerts.process_decisions(decisions)
-
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        print(f"\n── Cycle {cycle+1} ── {ts} UTC")
-
-        for sid, d in decisions.items():
-            icon = ("🔴" if d["severity"] == "CRITICAL" else
-                    "🟠" if d["severity"] == "HIGH"     else
-                    "🟡" if d["severity"] == "MEDIUM"   else "🟢")
-            features = d.get("features", {})
-            trend    = _trend_direction(
-                features.get("delta_1", 0.0),
-                features.get("delta_5", 0.0),
-            )
-            print(f"  {icon} {d['server_name']:<28} "
-                  f"CPU={d['current_cpu']:>5.1f}%  "
-                  f"{d['decision']:<10} "
-                  f"trend={trend}")
-
-        if sent:
-            print(f"\n  📨 Alerts this cycle: {len(sent)}")
-            for s in sent:
-                mode = "DRY-RUN" if s["dry_run"] else "SENT"
-                print(f"     [{mode}] {s['server_id']} → {s['decision']}")
-        else:
-            print(f"\n  📭 No alerts (cooldown or severity)")
-
+    alerts = AlertSystem()
     stats = alerts.get_stats()
-    print(f"\n── Alert Stats ──")
-    print(f"  Total sent:   {stats['sent']}")
-    print(f"  Total failed: {stats['failed']}")
-    print(f"  Mode:         {'LIVE' if stats['enabled'] else 'DRY-RUN'}")
+    print(f"  Slack: {'LIVE' if stats['slack_enabled'] else 'DISABLED'}")
+    print(f"  Email: {'LIVE' if stats['email_enabled'] else 'DISABLED'}")
+
+    # Simulate an ESCALATE decision
+    mock_decision = {
+        "server_id": "server_e",
+        "server_name": "Server E — Critical",
+        "current_cpu": 91.5,
+        "predicted_cpu": 93.2,
+        "confidence": 0.85,
+        "crash_risk_5min": 0.78,
+        "risk_score": 0.82,
+        "decision": "ESCALATE",
+        "severity": "CRITICAL",
+        "trend": "rapidly_rising",
+        "spike_count": 12,
+        "reason": "Sustained CPU >90% with rising trend — system crash imminent",
+        "action": "Paging on-call engineer — SLA breach risk",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+    }
+
+    result = alerts._process_one("server_e", mock_decision)
+    if result:
+        print(f"\n  Alert fired: {result}")
+    else:
+        print("\n  Alert suppressed (cooldown)")
+
+    print(f"\n  Stats: {alerts.get_stats()}")
     print("\n✅ Alert system test complete.")

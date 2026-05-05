@@ -511,9 +511,13 @@ class DecisionEngine:
         self._escalation_start:    dict[str, float] = {}
         self._session_start        = time.time()
         
-        # CPU tracking for sustained time-based rules
+        # CPU tracking for sustained time-based rules (120s rolling window)
         self._cpu_buffer: dict[str, list[tuple[float, float]]] = {}
         self._last_action_time: dict[str, float] = {}
+        
+        # ACTION FEEDBACK — tracks before/after CPU to measure effectiveness
+        self._action_feedback: dict[str, dict] = {}  # server_id → {action_cpu, action_time, decision}
+        self._feedback_log: list[dict] = []  # historical feedback entries
         
         # Evaluation metrics — tracks decision quality over session + historical baseline
         self._eval = {
@@ -527,7 +531,6 @@ class DecisionEngine:
         }
         self._prev_cpu: dict[str, float] = {}  # for incident prevention tracking
         self._stable_windows: dict[str, int] = {}
-        self._scale_exit_windows: dict[str, int] = {}
         self._scale_exit_windows: dict[str, int] = {}
 
     def _update_cpu_buffer(self, server_id: str, current_cpu: float):
@@ -554,6 +557,65 @@ class DecisionEngine:
             if oldest_above is not None and (now - oldest_above) >= duration:
                 return True
             return False
+
+    def _compute_slope(self, server_id: str) -> float:
+        """Compute CPU trend slope (degrees/sec) from rolling buffer."""
+        with self._lock:
+            buf = self._cpu_buffer.get(server_id, [])
+            if len(buf) < 3:
+                return 0.0
+            # Use last 30 seconds for slope
+            now = time.time()
+            recent = [(t, c) for t, c in buf if now - t <= 30]
+            if len(recent) < 2:
+                return 0.0
+            t0, c0 = recent[0]
+            t1, c1 = recent[-1]
+            dt = t1 - t0
+            if dt < 1.0:
+                return 0.0
+            return (c1 - c0) / dt  # CPU% per second
+
+    def _is_recovering(self, server_id: str, current_cpu: float, predicted_cpu: float) -> bool:
+        """Detect self-recovery: predicted < current AND trend decreasing."""
+        slope = self._compute_slope(server_id)
+        return predicted_cpu < current_cpu and slope < -0.1
+
+    def _record_action_feedback(self, server_id: str, current_cpu: float, decision: str):
+        """Track CPU at time of action for before→after comparison."""
+        if decision in ("SCALE", "ESCALATE"):
+            self._action_feedback[server_id] = {
+                "action_cpu": current_cpu,
+                "action_time": time.time(),
+                "decision": decision,
+            }
+        elif decision == "STABLE" and server_id in self._action_feedback:
+            fb = self._action_feedback.pop(server_id)
+            elapsed = time.time() - fb["action_time"]
+            entry = {
+                "server_id": server_id,
+                "decision": fb["decision"],
+                "before_cpu": round(fb["action_cpu"], 2),
+                "after_cpu": round(current_cpu, 2),
+                "delta": round(fb["action_cpu"] - current_cpu, 2),
+                "elapsed_seconds": round(elapsed, 1),
+                "effective": fb["action_cpu"] > current_cpu,
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            }
+            self._feedback_log.append(entry)
+            if len(self._feedback_log) > 200:
+                self._feedback_log = self._feedback_log[-200:]
+            logger.info(
+                f"[FEEDBACK] {server_id}: {fb['decision']} "
+                f"{entry['before_cpu']}% → {entry['after_cpu']}% "
+                f"(Δ={entry['delta']}%, {entry['elapsed_seconds']}s, "
+                f"{'EFFECTIVE' if entry['effective'] else 'INEFFECTIVE'})"
+            )
+
+    def get_action_feedback(self) -> list[dict]:
+        """Returns action feedback log for dashboard."""
+        with self._lock:
+            return list(self._feedback_log)
 
     def get_eval_metrics(self) -> dict:
         """Returns evaluation metrics for dashboard display."""
@@ -666,25 +728,36 @@ class DecisionEngine:
         # ── Update CPU buffer ──────────────────────────────────
         self._update_cpu_buffer(server_id, current_cpu)
 
-        # ── 1. Prediction vs Action Consistency ────────────────
-        force_scale = False
-        if (corrected_pred > 90.0 or risk > 0.60) and adjusted_conf > 0.60:
-            force_scale = True
+        # ── Compute slope for temporal reasoning ──────────────
+        slope = self._compute_slope(server_id)
+        is_recovering = self._is_recovering(server_id, current_cpu, corrected_pred)
 
-        # ── 2. Decision Logic Core ─────────────────────────────
+        # ── 1. RISK-FIRST DECISION (crash_risk drives, CPU supports) ──
+        # crash_risk is computed below after spike_prob+risk are ready
+        trend_boost = {"rapidly_rising":0.20,"rising":0.10,"elevated":0.05}.get(trend,0.0)
+        crash_risk = min(0.6*spike_prob + 0.3*risk + trend_boost, 1.0)
+
+        # ── 2. Decision Logic Core — TEMPORAL + RISK-FIRST ─────
         if current_cpu > 90:
-            # 8. EMERGENCY OVERRIDE (Hard Rule)
+            # EMERGENCY OVERRIDE — skip state machine
             decision = "ESCALATE"
         elif self._sustained_above(server_id, 85, 120):
-            # 2. TIME-BASED ESCALATION
+            # TIME-BASED: >85% for 2 min straight
             decision = "ESCALATE"
-        elif self._sustained_above(server_id, 80, 60):
-            # 2. TIME-BASED ESCALATION
+        elif self._sustained_above(server_id, 80, 60) and slope >= 0:
+            # TIME-BASED: >80% for 1 min AND not falling
             decision = "SCALE"
-        elif force_scale:
+        elif is_recovering and current_cpu < 90:
+            # RECOVERY-AWARE: system is self-healing, do NOT scale
+            decision = "MONITOR"
+        elif crash_risk > 0.65:
+            # RISK-FIRST: high crash risk drives SCALE
             decision = "SCALE"
+        elif crash_risk > 0.40:
+            # RISK-FIRST: moderate risk → MONITOR
+            decision = "MONITOR"
         elif corrected_pred > 90.0 and trend in ("rising", "rapidly_rising"):
-            # 4. PREEMPTIVE DECISION LAYER
+            # PREEMPTIVE: predicted >90% with upward trend
             decision = "SCALE_READY"
         elif corrected_pred > MONITOR_CPU_THRESHOLD or risk > 0.55:
             decision = "MONITOR"
@@ -722,6 +795,9 @@ class DecisionEngine:
             self._last_action_time[server_id] = now
             
         self._last_decision_str[server_id] = decision
+
+        # ── ACTION FEEDBACK — track before/after CPU ───────────
+        self._record_action_feedback(server_id, current_cpu, decision)
 
         # ── Action confidence — how confident is the decision itself? ──
         # Combines: signal strength (risk), model certainty (adj_conf), trend alignment
@@ -762,10 +838,8 @@ class DecisionEngine:
         severity = DECISIONS[decision]["severity"]
         color    = DECISIONS[decision]["color"]
 
-        # ── Crash risk (5 min horizon) — dashboard headline metric ──
-        # Combines spike_prob, risk score and trend into one number
-        trend_boost = {"rapidly_rising":0.20,"rising":0.10,"elevated":0.05}.get(trend,0.0)
-        crash_risk_5min = round(min(0.6*spike_prob + 0.3*risk + trend_boost, 1.0), 4)
+        # ── Crash risk — already computed above for risk-first logic ──
+        crash_risk_5min = round(crash_risk, 4)
 
         # ── Alert Registry ─────────────────────────────
         inc_result = self._alert_registry.register_decision(
@@ -806,6 +880,8 @@ class DecisionEngine:
             "spike_rate":              round(spike_rate,           2),
             "risk_score":              risk,
             "trend":                   trend,
+            "trend_slope":             round(slope, 4),
+            "is_recovering":           is_recovering,
             "rolling_std":             round(rolling_std,          2),
             "rolling_mean":            round(rolling_mean,         2),
             "alert_ready":             alert_ready,

@@ -150,6 +150,8 @@ def api_status():
                 "action":                 d["action"],
                 "risk_score":             d.get("risk_score", 0.0),
                 "trend":                  d.get("trend", "stable"),
+                "trend_slope":            d.get("trend_slope", 0.0),
+                "is_recovering":          d.get("is_recovering", False),
                 "spike_count":            d["spike_count"],
                 "spike_rate":             d.get("spike_rate", 0.0),
                 "rolling_std":            d["rolling_std"],
@@ -289,6 +291,24 @@ def api_metrics():
     """Returns decision evaluation metrics."""
     try:
         return jsonify(engine.get_eval_metrics())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/feedback")
+def api_feedback():
+    """Returns action feedback log — before/after CPU tracking."""
+    try:
+        return jsonify(engine.get_action_feedback())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/alert-stats")
+def api_alert_stats():
+    """Returns alert delivery statistics."""
+    try:
+        return jsonify(alerts.get_stats())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
