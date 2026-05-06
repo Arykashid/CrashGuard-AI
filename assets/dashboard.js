@@ -20,6 +20,11 @@ const S = {
   expandedAlerts: {},
   sessionStart: Date.now(),
   lastAlertSeed: Date.now(),
+  decisionVersion: 0,
+  // Rolling-window smoothing for model metrics (prevents jumpy display)
+  smoothedReliability: null,
+  smoothedDivergence: null,
+  smoothedCiWidth: null,
 };
 
 const DC = {
@@ -96,7 +101,6 @@ function navigateTo(page) {
   if (page === 'systems') renderSystemsPage();
   if (page === 'alerts') renderAlertsPage();
   if (page === 'models') renderModelsPage();
-  if (page === 'predictions') renderPredictionsPage();
 }
 
 // Nav items now use onclick="navigateTo('page')" directly in HTML
@@ -188,6 +192,8 @@ function processData(data) {
 
   // Store eval metrics from backend
   if (data.eval_metrics) S.metrics = data.eval_metrics;
+  // Track decision version for staleness detection
+  if (data.decision_version != null) S.decisionVersion = data.decision_version;
 
   let critCount = 0, worstServer = null, worstPriority = -1;
   const PRIORITY = { ESCALATE: 5, SCALE: 4, RESTART: 3, MONITOR: 2, STABLE: 1 };
@@ -467,14 +473,18 @@ function renderAlertsPage() {
   const at = document.getElementById('alrt-total'); if (at) at.textContent = S.alertLog.length;
   const ac = document.getElementById('alrt-critical'); if (ac) ac.textContent = critical;
 
-  // Add dedup ratio if metrics available
+  // Add dedup ratio if metrics available — FIX 2: use suppression breakdown
   const dedupEl = document.getElementById('alrt-dedup');
   if (dedupEl && S.metrics) {
-      const suppressed = S.metrics.alerts_suppressed || 0;
-      const total = suppressed + (S.metrics.interventions || 0);
-      const ratio = S.metrics.dedup_ratio || 0;
+      const byCooldown = S.metrics.suppressed_by_cooldown || 0;
+      const bySeverity = S.metrics.suppressed_by_severity || 0;
+      const totalSuppressed = byCooldown + bySeverity;
+      const interventions = S.metrics.interventions || 0;
+      const total = totalSuppressed + interventions;
+      const ratio = total > 0 ? Math.round(totalSuppressed / total * 100) : 0;
       dedupEl.textContent = ratio + '%';
-      dedupEl.nextElementSibling.textContent = `${suppressed} of ${total} alerts suppressed`;
+      const subEl = dedupEl.nextElementSibling;
+      if (subEl) subEl.textContent = `${totalSuppressed} suppressed (${byCooldown} cooldown, ${bySeverity} severity)`;
   }
 
   // ALERT DATA GUARD
@@ -507,10 +517,6 @@ function renderAlertsPage() {
     
     // SAFE ACCESS AND INITIALIZATION
     const activeDecision = liveServer?.decision || a?.decision || "UNKNOWN";
-    
-    // DEBUG LOGGING
-    console.log("ACTIVE DECISION:", activeDecision);
-    console.log("ALERTS:", S.alertLog);
 
     // Build the incident investigation panel
     let drillDown = '';
@@ -622,11 +628,22 @@ function toggleAlertRow(idx) {
 // ── MODELS PAGE ────────────────────────────────────────────────
 function renderModelsPage() {
   const servers = Object.values(S.servers);
-  const server = servers[0];
-  const modelUsed = server?.model_used || 'ensemble';
-  const reliability = server?.model_reliability || 1.0;
+  if (!servers.length) return;
 
-  // Stat cards
+  // Fleet-wide averages (not single-server snapshot)
+  const avgReliability = servers.reduce((a, s) => a + (s.model_reliability || 1), 0) / servers.length;
+  const avgDisagreement = servers.reduce((a, s) => a + (s.prediction_disagreement || 0), 0) / servers.length;
+  const avgCiW = servers.reduce((a, s) => a + Math.abs((s.ci_upper || 0) - (s.ci_lower || 0)), 0) / servers.length;
+
+  // Exponential moving average smoothing (alpha=0.3) to prevent jumpy metrics
+  const alpha = 0.3;
+  S.smoothedReliability = S.smoothedReliability == null ? avgReliability : alpha * avgReliability + (1 - alpha) * S.smoothedReliability;
+  S.smoothedDivergence = S.smoothedDivergence == null ? avgDisagreement : alpha * avgDisagreement + (1 - alpha) * S.smoothedDivergence;
+  S.smoothedCiWidth = S.smoothedCiWidth == null ? avgCiW : alpha * avgCiW + (1 - alpha) * S.smoothedCiWidth;
+
+  const modelUsed = servers[0]?.model_used || 'ensemble';
+
+  // Stat cards — use smoothed fleet averages
   const el = document.getElementById('model-status-live');
   if (el) {
     el.textContent = modelUsed === 'warming_up' ? 'Warming Up' :
@@ -635,48 +652,44 @@ function renderModelsPage() {
     el.style.color = modelUsed === 'warming_up' ? 'var(--yellow)' : 'var(--green)';
   }
   const mr = document.getElementById('model-reliability-live');
-  if (mr) { mr.textContent = (reliability * 100).toFixed(0) + '%'; mr.style.color = reliability > 0.7 ? 'var(--green)' : 'var(--orange)'; }
+  if (mr) {
+    const val = S.smoothedReliability;
+    mr.textContent = (val * 100).toFixed(0) + '%';
+    mr.style.color = val > 0.7 ? 'var(--green)' : 'var(--orange)';
+  }
 
-  // Prediction divergence (normalized) — FIX #4 tighter thresholds
+  // Prediction divergence — smoothed fleet average
   const md = document.getElementById('model-disagreement-live');
-  if (md && server) {
-    const disagree = server.prediction_disagreement || 0;
-    const disagPct = (disagree * 100).toFixed(1);
-    md.textContent = disagPct + '%';
-    // good: <8%  |  warning: 8-15%  |  critical: 15-20%  |  degraded: >20%
+  if (md) {
+    const disagree = S.smoothedDivergence;
+    md.textContent = (disagree * 100).toFixed(1) + '%';
     md.style.color = disagree > 0.20 ? 'var(--red)' : disagree > 0.15 ? '#ef4444' : disagree > 0.08 ? 'var(--orange)' : 'var(--green)';
   }
 
-  // Avg CI width
+  // Avg CI width — smoothed
   const mci = document.getElementById('model-ci-width');
-  if (mci && servers.length) {
-    const avgWidth = servers.reduce((a, s) => {
-      const w = (s.ci_upper || 0) - (s.ci_lower || 0);
-      return a + Math.abs(w);
-    }, 0) / servers.length;
-    mci.textContent = avgWidth.toFixed(1) + '%';
-    mci.style.color = avgWidth > 20 ? 'var(--orange)' : 'var(--blue)';
+  if (mci) {
+    const val = S.smoothedCiWidth;
+    mci.textContent = val.toFixed(1) + '%';
+    mci.style.color = val > 20 ? 'var(--orange)' : 'var(--blue)';
   }
 
   // Live trust indicators table
   const tbody = document.getElementById('trust-indicators-body');
   if (tbody && servers.length) {
-    const avgReliability = servers.reduce((a, s) => a + (s.model_reliability || 1), 0) / servers.length;
-    const avgDisagreement = servers.reduce((a, s) => a + (s.prediction_disagreement || 0), 0) / servers.length;
     const avgConf = servers.reduce((a, s) => a + ((s.adjusted_confidence || s.confidence || 0)), 0) / servers.length;
-    const avgCiW = servers.reduce((a, s) => a + Math.abs((s.ci_upper || 0) - (s.ci_lower || 0)), 0) / servers.length;
     const fpRate = S.metrics.false_positive_rate || 0;
 
     // FIX #4 — divergence uses 3-tier status: PASS / WARN / FAIL
-    const divStatus = avgDisagreement > 0.20 ? 'FAIL' : avgDisagreement > 0.08 ? 'WARN' : 'PASS';
+    const divStatus = S.smoothedDivergence > 0.20 ? 'FAIL' : S.smoothedDivergence > 0.08 ? 'WARN' : 'PASS';
     const divOk = divStatus === 'PASS';
     const divFail = divStatus === 'FAIL';
 
     const indicators = [
-      { name: 'Model Reliability', value: (avgReliability * 100).toFixed(1) + '%', threshold: '> 70%', ok: avgReliability > 0.7, fail: avgReliability < 0.5 },
+      { name: 'Model Reliability', value: (S.smoothedReliability * 100).toFixed(1) + '%', threshold: '> 70%', ok: S.smoothedReliability > 0.7, fail: S.smoothedReliability < 0.5 },
       { name: 'Ensemble Confidence', value: (avgConf * 100).toFixed(0) + '%', threshold: '> 50%', ok: avgConf > 0.5, fail: avgConf < 0.3 },
-      { name: 'Prediction Divergence', value: (avgDisagreement * 100).toFixed(1) + '%', threshold: '< 8%', ok: divOk, fail: divFail },
-      { name: 'CI Width (avg)', value: avgCiW.toFixed(1) + '%', threshold: '< 20%', ok: avgCiW < 20, fail: avgCiW > 30 },
+      { name: 'Prediction Divergence', value: (S.smoothedDivergence * 100).toFixed(1) + '%', threshold: '< 8%', ok: divOk, fail: divFail },
+      { name: 'CI Width (avg)', value: S.smoothedCiWidth.toFixed(1) + '%', threshold: '< 20%', ok: S.smoothedCiWidth < 20, fail: S.smoothedCiWidth > 30 },
       { name: 'False Positive Rate', value: (fpRate * 100).toFixed(1) + '%', threshold: '< 25%', ok: fpRate < 0.25, fail: fpRate > 0.5 },
       { name: '80% CI Coverage', value: '80.0%', threshold: '= 80%', ok: true, fail: false },
     ];

@@ -52,6 +52,14 @@ pipeline  = None
 engine    = None
 alerts    = None
 _started  = False
+
+# ── CANONICAL DECISION STATE ────────────────
+# Single source of truth: evaluate() is called in ONE place,
+# result is cached here, consumed by both /api/status and alert_worker.
+_decision_lock    = threading.Lock()
+_latest_decisions = {}       # server_id → decision dict
+_latest_timestamp = None     # ISO timestamp of last evaluation
+_decision_version = 0        # monotonic counter for staleness detection
 _init_lock = threading.Lock()
 
 
@@ -67,38 +75,45 @@ def initialize():
         pipeline.start()
         engine  = DecisionEngine()
         alerts  = AlertSystem()
-        # FIX 2 — start background alert worker
-        _start_alert_worker()
+        # Start single decision loop (replaces old alert_worker)
+        _start_decision_loop()
         _started = True
         logger.info("All components started.")
 
 
 # ─────────────────────────────────────────────
-# FIX 2 — BACKGROUND ALERT WORKER
-# Decouples alert processing from request cycle.
-# Runs every 2 seconds independently of API calls.
+# DECISION EVALUATOR — SINGLE PATH
+# Runs every 2s in background. Produces canonical decisions.
+# Both /api/status and alert_worker consume from this cache.
 # ─────────────────────────────────────────────
 
-def _alert_worker():
-    """Background thread — processes alerts every 2 seconds."""
+def _decision_loop():
+    """Background thread — evaluates decisions + dispatches alerts every 2s."""
+    global _latest_decisions, _latest_timestamp, _decision_version
     while True:
         try:
             if pipeline and engine and alerts:
                 predictions = pipeline.get_predictions()
                 if predictions:
                     decisions = engine.evaluate(predictions)
-                    sent      = alerts.process_decisions(decisions)
+                    ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                    with _decision_lock:
+                        _latest_decisions = decisions
+                        _latest_timestamp = ts
+                        _decision_version += 1
+                    # Dispatch alerts immediately after decision generation
+                    sent = alerts.process_decisions(decisions)
                     if sent:
-                        logger.info(f"Alert worker fired {len(sent)} alert(s).")
+                        logger.info(f"Decision loop fired {len(sent)} alert(s).")
         except Exception as e:
-            logger.error(f"Alert worker error: {e}")
+            logger.error(f"Decision loop error: {e}")
         time.sleep(2)
 
 
-def _start_alert_worker():
-    t = threading.Thread(target=_alert_worker, daemon=True, name="AlertWorker")
+def _start_decision_loop():
+    t = threading.Thread(target=_decision_loop, daemon=True, name="DecisionLoop")
     t.start()
-    logger.info("Alert worker started.")
+    logger.info("Decision loop started.")
 
 
 @app.before_request
@@ -119,14 +134,17 @@ def index():
 @app.route("/api/status")
 def api_status():
     """
-    FIX 3 — wrapped in try/except.
-    Returns latest predictions + decisions for all 5 servers.
-    Called by dashboard.js every 2 seconds.
-    Alert processing is now handled by background worker — not here.
+    Returns canonical decisions + predictions for all 5 servers.
+    Reads from the shared decision cache — does NOT re-evaluate.
+    This ensures all pages see the same decision state.
     """
     try:
-        decisions   = engine.get_last_decisions()
-        predictions = pipeline.get_predictions()
+        with _decision_lock:
+            decisions = dict(_latest_decisions)
+            ts       = _latest_timestamp
+            version  = _decision_version
+
+        predictions = pipeline.get_predictions() if pipeline else {}
 
         servers = []
         for sid, d in decisions.items():
@@ -168,10 +186,11 @@ def api_status():
         eval_metrics = engine.get_eval_metrics()
 
         return jsonify({
-            "servers":      servers,
-            "eval_metrics": eval_metrics,
-            "timestamp":    datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            "status":       "ok",
+            "servers":          servers,
+            "eval_metrics":     eval_metrics,
+            "timestamp":        ts or datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "decision_version": version,
+            "status":           "ok",
         })
 
     except Exception as e:
@@ -288,9 +307,18 @@ def api_demo_trigger():
 
 @app.route("/api/metrics")
 def api_metrics():
-    """Returns decision evaluation metrics."""
+    """Returns decision evaluation metrics + alert suppression stats from BOTH sources."""
     try:
-        return jsonify(engine.get_eval_metrics())
+        metrics = engine.get_eval_metrics()
+        # Merge suppression stats from alert_system (delivery-layer dedup)
+        if alerts:
+            alert_stats = alerts.get_stats()
+            metrics["suppressed_by_cooldown"] = alert_stats.get("suppressed_by_cooldown", 0)
+            metrics["suppressed_by_severity"] = alert_stats.get("suppressed_by_severity", 0)
+            metrics["email_sent"]             = alert_stats.get("email_sent", 0)
+            metrics["slack_enabled"]          = alert_stats.get("slack_enabled", False)
+            metrics["email_enabled"]          = alert_stats.get("email_enabled", False)
+        return jsonify(metrics)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -350,6 +378,11 @@ if __name__ == "__main__":
         print("  Slack: CONFIGURED ✅")
     else:
         print("  Slack: DRY-RUN (set SLACK_WEBHOOK_URL to enable)")
+
+    if os.getenv("SMTP_USER") and os.getenv("SMTP_PASS"):
+        print("  Email: CONFIGURED ✅")
+    else:
+        print("  Email: DRY-RUN (set SMTP_USER/SMTP_PASS/ALERT_EMAIL to enable)")
 
     print("=" * 60)
     print()
