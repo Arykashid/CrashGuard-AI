@@ -43,7 +43,7 @@ MONITOR_CPU_THRESHOLD  = 0.68 * MAX_CPU   # 64.6%
 RESTART_STD_THRESHOLD  = 0.14 * MAX_CPU   # 13.3%
 SPIKE_CPU_THRESHOLD    = 0.80 * MAX_CPU   # 76%
 SPIKE_RESTART_COUNT    = 3
-SPIKE_ESCALATE_COUNT   = 10
+SPIKE_ESCALATE_COUNT   = 3
 SPIKE_WINDOW_SECONDS   = 600
 ALERT_COOLDOWN_SECONDS = 300
 
@@ -168,7 +168,7 @@ class AlertRegistry:
                 elapsed = (now - created_at).total_seconds()
                 
                 # Prevent duplicate alerts within rolling time window (e.g. 2 min)
-                if decision == alert["decision"] and elapsed < 120:
+                if decision == alert["decision"] and elapsed < 300:
                     return {"alert": False, "reason": "deduplicated", "incident_id": alert["id"], "transition": None}
                 
                 # If we've passed the deduplication window or decision changed, transition state
@@ -767,7 +767,7 @@ class DecisionEngine:
         if current_cpu > 90:
             # EMERGENCY OVERRIDE — skip state machine
             decision = "ESCALATE"
-        elif self._sustained_above(server_id, 85, 120):
+        elif self._sustained_above(server_id, 85, 30):
             # TIME-BASED: >85% for 2 min straight
             decision = "ESCALATE"
         elif self._sustained_above(server_id, 80, 60) and slope >= 0:

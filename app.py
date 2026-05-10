@@ -75,6 +75,12 @@ def initialize():
         pipeline.start()
         engine  = DecisionEngine()
         alerts  = AlertSystem()
+
+        print("[BOOT] alert worker started")
+        print("[BOOT] Twilio credentials loaded")
+        print("[BOOT] SMTP credentials loaded")
+        print("[BOOT] Cooldown manager initialized=True")
+
         # Start single decision loop (replaces old alert_worker)
         _start_decision_loop()
         _started = True
@@ -302,6 +308,16 @@ def api_demo_trigger():
 
     except Exception as e:
         logger.error(f"/api/demo/trigger error: {e}")
+        return jsonify({"error": str(e), "status": "error"}), 500
+
+
+@app.route("/api/timeline")
+def api_timeline():
+    """Returns timeline events for the dashboard."""
+    try:
+        return jsonify(alerts.get_timeline() if alerts else [])
+    except Exception as e:
+        logger.error(f"/api/timeline error: {e}")
         return jsonify({"error": str(e), "status": "error"}), 500
 
 

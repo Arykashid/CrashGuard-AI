@@ -163,13 +163,15 @@ Chart.register({
 // ── FETCH ──────────────────────────────────────────────────────
 async function fetchStatus() {
   try {
-    const [rStat, rAlerts] = await Promise.all([
+    const [rStat, rAlerts, rTimeline] = await Promise.all([
       fetch('/api/status'),
-      fetch('/api/alerts')
+      fetch('/api/alerts'),
+      fetch('/api/timeline')
     ]);
-    if (!rStat.ok || !rAlerts.ok) throw new Error('HTTP Error');
+    if (!rStat.ok || !rAlerts.ok || !rTimeline.ok) throw new Error('HTTP Error');
     const data = await rStat.json();
     data.alerts = await rAlerts.json();
+    data.timeline = await rTimeline.json();
     processData(data);
     setConn(true);
   } catch (e) { setConn(false); }
@@ -250,6 +252,7 @@ function processData(data) {
   }).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
   S.alertCount = S.alertLog.length;
+  S.timeline = (data.timeline || []).slice().reverse(); // show latest first
   
   if (critCount > 0 && S.alertLog.length === 0) {
     throw new Error("Inconsistent alert state — registry failure");
@@ -258,6 +261,7 @@ function processData(data) {
   if (worstServer) updateHero(worstServer);
   renderServers(servers);
   renderFleet(servers);
+  renderIncidents();
   updateStats(critCount, servers);
 
   // Main graph tracks highest-risk server unless user manually selected
@@ -411,27 +415,34 @@ function renderFleet(servers) {
 }
 
 // ── INCIDENTS ──────────────────────────────────────────────────
-function addIncident(s, now) {
-  const dc = DC[s.decision] || DC.STABLE;
-  const ts = now.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' });
-  S.incidents.unshift({ ts, server: s.server_name.split('—')[0].trim(), decision: s.decision, reason: s.reason, color: dc.color, tagBg: dc.bg, tagColor: dc.color });
-  if (S.incidents.length > 20) S.incidents.pop();
-  renderIncidents();
-}
-
 function renderIncidents() {
   const el = document.getElementById('incident-list');
   if (!el) return;
   const ic = document.getElementById('inc-count');
-  if (ic) ic.textContent = S.incidents.length + ' events';
-  if (S.incidents.length === 0) { el.innerHTML = '<div style="padding:14px;color:var(--text3);font-size:12px;text-align:center">No incidents yet</div>'; return; }
-  el.innerHTML = S.incidents.slice(0, 6).map(i => `
+  if (ic) ic.textContent = (S.timeline || []).length + ' events';
+  if (!S.timeline || S.timeline.length === 0) {
+    el.innerHTML = '<div style="padding:14px;color:var(--text3);font-size:12px;text-align:center">No incidents yet</div>'; 
+    return;
+  }
+  
+  el.innerHTML = S.timeline.slice(0, 10).map(i => {
+    // Determine colors
+    const typeStr = (i.type || 'UNKNOWN').toUpperCase();
+    let bg = 'rgba(255,255,255,0.05)', color = 'var(--text2)';
+    if (typeStr === 'ESCALATE' || typeStr.includes('FAILED')) { color = '#ef4444'; bg = 'rgba(239,68,68,0.1)'; }
+    else if (typeStr === 'SCALE') { color = '#f97316'; bg = 'rgba(249,115,22,0.1)'; }
+    else if (typeStr === 'MONITOR' || typeStr.includes('SUPPRESSED')) { color = '#eab308'; bg = 'rgba(234,179,8,0.1)'; }
+    else if (typeStr.includes('SENT') || typeStr.includes('TRIGGERED')) { color = '#22c55e'; bg = 'rgba(34,197,94,0.1)'; }
+    
+    const timeStr = new Date(i.timestamp || Date.now()).toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    
+    return `
     <div class="inc-row">
-      <div class="inc-dot" style="background:${i.color}"></div>
-      <span class="inc-time">${i.ts}</span>
-      <div class="inc-body"><div class="inc-title">${i.decision} — ${i.server}</div><div class="inc-sub">${i.reason.substring(0, 55)}...</div></div>
-      <span class="inc-tag" style="background:${i.tagBg};color:${i.tagColor}">${i.decision}</span>
-    </div>`).join('');
+      <div class="inc-dot" style="background:${color}"></div>
+      <span class="inc-time">${timeStr}</span>
+      <div class="inc-body"><div class="inc-title">${i.type} — ${i.server_id}</div><div class="inc-sub">${i.message || ''}</div></div>
+    </div>`;
+  }).join('');
 }
 
 // ── SYSTEMS PAGE ───────────────────────────────────────────────

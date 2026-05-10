@@ -1,20 +1,30 @@
 """
 alert_system.py — CrashGuard AI (Production Grade)
-Unified alert engine: Slack + Email + Cooldown + Layered Fallback.
+Unified alert engine: Twilio + Slack + Email + Cooldown + Layered Fallback.
 
 Alerts are DERIVED from DecisionEngine output — zero independent logic.
 
 Delivery architecture:
-  try: send_slack()
-  except: send_email()
-  else: log_dry_run()
+  ESCALATE → Twilio phone call (fallback: email → Slack → dry-run)
+  SCALE    → Email (fallback: Slack → dry-run)
+  MONITOR  → Email (fallback: Slack → dry-run)
+  STABLE   → No action
 
 FIX 2 — Realistic alert deduplication with per-server suppression tracking.
 FIX 3 — Gmail SMTP email alerts for CRITICAL + HIGH severity.
-         Priority: Slack → Email → DRY-RUN log.
+FIX 4 — Twilio phone call for ESCALATE decisions.
          Non-blocking with exponential backoff retry.
 
 Cooldown: 300s (5 minutes) per server per channel.
+
+Windows env vars (set BEFORE python app.py):
+  set TWILIO_ACCOUNT_SID=your_account_sid
+  set TWILIO_AUTH_TOKEN=your_token
+  set TWILIO_FROM_NUMBER=+1234567890
+  set TWILIO_TO_NUMBER=+0987654321
+  set SMTP_USER=your@gmail.com
+  set SMTP_PASS=your-16-char-app-password
+  set ALERT_EMAIL=your@gmail.com
 """
 
 import os
@@ -30,6 +40,14 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
 from typing import Optional
+
+# Safe Twilio import — graceful degradation if not installed
+try:
+    from twilio.rest import Client as TwilioClient
+    TWILIO_AVAILABLE = True
+except ImportError:
+    TwilioClient = None
+    TWILIO_AVAILABLE = False
 
 logger = logging.getLogger("crashguard.alerts")
 
@@ -81,9 +99,9 @@ SEVERITY_COLOR = {
     "INFO":     "#00BFFF",
 }
 
-# FIX 3 — Email fires for CRITICAL and HIGH severity (ESCALATE + SCALE)
-ALERTABLE_DECISIONS = {"ESCALATE", "SCALE"}
-EMAIL_DECISIONS     = {"ESCALATE", "SCALE"}  # FIX 3: both CRITICAL and HIGH
+# FIX 3 — Email fires for CRITICAL and HIGH severity (ESCALATE + SCALE) + RESTART/MONITOR
+ALERTABLE_DECISIONS = {"ESCALATE", "SCALE", "SCALE_READY", "RESTART", "MONITOR"}
+EMAIL_DECISIONS     = {"ESCALATE", "SCALE", "RESTART", "MONITOR"}
 
 # FIX 2 — Suppression sanity cap per session
 MAX_SUPPRESSIONS_PER_SESSION = 50
@@ -232,7 +250,9 @@ def build_email(alert: dict, smtp_user: str, email_to: str) -> MIMEMultipart:
         f"Reason: {alert['reason']}\n"
         f"Action: {alert['action']}\n"
         "\n"
-        f"Timestamp: {alert['timestamp']}\n"
+        f"Alert Generated: {alert['timestamp']}\n"
+        f"Email Sent:      {datetime.now(timezone.utc).isoformat(timespec='milliseconds')}\n"
+        f"Delivery Delay:  {int((datetime.now(timezone.utc) - datetime.fromisoformat(alert['timestamp'])).total_seconds())}s\n"
         "\n"
         "-- CrashGuard AI Autonomous Decision System\n"
     )
@@ -274,8 +294,11 @@ class AlertSystem:
         self._sent_count      = 0
         self._fail_count      = 0
         self._email_sent      = 0
+        self._twilio_sent     = 0
         self._dry_run_count   = 0
         self._alert_log: list[dict] = []
+        self._timeline: list[dict] = []
+        self._last_decision: dict[str, str] = {}
 
         # FIX 2 — Per-server suppression tracking
         self._suppressed_by_cooldown: dict[str, int] = {}  # server_id → count
@@ -296,7 +319,30 @@ class AlertSystem:
             print(f"[ALERT] Email configured ({cfg['user']} → {cfg['to']}).")
         else:
             logger.warning("Alert system: No email configured — set SMTP_USER/SMTP_PASS/ALERT_EMAIL.")
-            print("[ALERT] ⚠ No email env vars detected at startup. Set SMTP_USER/SMTP_PASS/ALERT_EMAIL.")
+            print("[ALERT] No email env vars detected at startup. Set SMTP_USER/SMTP_PASS/ALERT_EMAIL.")
+
+        # Check Twilio config at init time for logging
+        if TWILIO_AVAILABLE and self._has_twilio():
+            print(f"[ALERT] Twilio configured (ESCALATE → phone call to {os.getenv('TWILIO_TO_NUMBER')}).")
+        elif TWILIO_AVAILABLE:
+            print("[ALERT] Twilio library installed but env vars missing. Set TWILIO_ACCOUNT_SID/AUTH_TOKEN/FROM/TO.")
+        else:
+            print("[ALERT] Twilio not installed — ESCALATE will fall back to email. pip install twilio>=8.0.0")
+
+    def _record_timeline(self, evt_type: str, server_id: str, message: str):
+        with self._lock:
+            self._timeline.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": evt_type,
+                "server_id": server_id,
+                "message": message
+            })
+            if len(self._timeline) > 100:
+                self._timeline.pop(0)
+
+    def get_timeline(self) -> list[dict]:
+        with self._lock:
+            return list(self._timeline)
 
     def process_decisions(self, decisions: dict[str, dict]) -> list[dict]:
         """Process all decisions from engine. Returns list of fired alerts."""
@@ -311,15 +357,7 @@ class AlertSystem:
         """Process single decision through alert pipeline."""
         dec = decision.get("decision", "STABLE")
         severity = SEVERITY_MAP.get(dec, "INFO")
-
-        # FIX 2 — Step 1: Check cooldown FIRST (before severity)
-        if not self._cooldown.can_send(server_id):
-            remaining = self._cooldown.seconds_remaining(server_id)
-            logger.debug(f"Alert suppressed for {server_id} — cooldown {remaining}s remaining")
-            with self._lock:
-                self._suppressed_by_cooldown[server_id] = self._suppressed_by_cooldown.get(server_id, 0) + 1
-                self._total_suppressed_session += 1
-            return None
+        server_name = decision.get('server_name', server_id)
 
         # FIX 2 — Step 2: Only alert on actionable decisions (severity filter)
         if dec not in ALERTABLE_DECISIONS:
@@ -331,6 +369,31 @@ class AlertSystem:
                         self._total_suppressed_session += 1
             return None
 
+        print(f"[ALERT_WORKER] received decision={dec} server={server_id}")
+        self._record_timeline(dec, server_id, f"Decision: {dec}")
+
+        with self._lock:
+            last_dec = self._last_decision.get(server_id, "STABLE")
+            self._last_decision[server_id] = dec
+
+        is_duplicate = (dec == last_dec)
+
+        # FIX 2 — Step 1: Check cooldown FIRST (before severity)
+        if not self._cooldown.can_send(server_id):
+            if not is_duplicate:
+                print(f"[COOLDOWN] Bypassed for {server_name} — decision changed from {last_dec} to {dec}")
+                self._record_timeline("COOLDOWN_BYPASSED", server_id, f"Changed to {dec}")
+            else:
+                remaining = self._cooldown.seconds_remaining(server_id)
+                print(f"[EMAIL] Suppressed by cooldown for {server_name}")
+                print(f"[EMAIL] Cooldown remaining: {remaining}s")
+                logger.debug(f"Alert suppressed for {server_id} — cooldown {remaining}s remaining")
+                self._record_timeline("COOLDOWN_SUPPRESSED", server_id, f"{remaining}s remaining")
+                with self._lock:
+                    self._suppressed_by_cooldown[server_id] = self._suppressed_by_cooldown.get(server_id, 0) + 1
+                    self._total_suppressed_session += 1
+                return None
+
         # FIX 2 — Sanity cap: if we've suppressed > 50 this session, log warning
         if self._total_suppressed_session > MAX_SUPPRESSIONS_PER_SESSION:
             logger.warning(
@@ -340,14 +403,27 @@ class AlertSystem:
 
         alert = build_structured_alert(decision)
 
-        # ── LAYERED DELIVERY (FIX 3) ──────────────────────
-        # Priority: Slack first → Email second → DRY-RUN third
-        slack_sent = False
-        email_sent = False
-        dry_run    = False
+        # ── LAYERED DELIVERY (FIX 3 + FIX 4) ─────────────
+        # ESCALATE → Twilio phone call (fallback: email → Slack → dry-run)
+        # SCALE/MONITOR → Slack → Email → dry-run
+        twilio_sent = False
+        slack_sent  = False
+        email_sent  = False
+        dry_run     = False
 
-        # Layer 1: Try Slack
-        if self._slack_enabled:
+        # Layer 0: Twilio phone call for ESCALATE (FIX 4)
+        current_cpu = alert.get("cpu", 0)
+        if (dec == "ESCALATE" or (dec == "SCALE" and current_cpu >= 80)) and TWILIO_AVAILABLE and self._has_twilio():
+            try:
+                print(f"[ROUTER] selected_channel=twilio server={server_id}")
+                self._send_twilio_async(alert)
+                twilio_sent = True
+            except Exception as e:
+                logger.error(f"Twilio queue failed for {server_id}: {e}")
+                print(f"[TWILIO] Failed to queue call for {server_id}: {e}")
+
+        # Layer 1: Try Slack (skip if Twilio already queued for ESCALATE)
+        if not twilio_sent and self._slack_enabled:
             try:
                 self._send_slack_async(alert)
                 slack_sent = True
@@ -356,19 +432,20 @@ class AlertSystem:
 
         # Layer 2: Email fallback (or additional for CRITICAL/HIGH)
         # FIX 3 — fires for CRITICAL and HIGH severity
-        # Re-read env vars NOW so late-set vars are picked up
-        if not slack_sent or dec in EMAIL_DECISIONS:
+        # Skip if Twilio queued (Twilio retry will fallback to email internally)
+        if not twilio_sent and (not slack_sent or dec in EMAIL_DECISIONS):
             email_cfg = self._get_email_config()
             if email_cfg:
                 try:
+                    print(f"[ROUTER] selected_channel=email server={server_id}")
                     self._send_email_async(alert, email_cfg)
                     email_sent = True
                 except Exception as e:
                     logger.error(f"Email send failed for {server_id}: {e}")
-                    print(f"[EMAIL] ❌ Failed to queue email for {server_id}: {e}")
+                    print(f"[EMAIL] Failed to queue email for {server_id}: {e}")
 
         # Layer 3: DRY-RUN log if nothing sent
-        if not slack_sent and not email_sent:
+        if not twilio_sent and not slack_sent and not email_sent:
             self._dry_run_log(alert)
             dry_run = True
 
@@ -385,10 +462,11 @@ class AlertSystem:
                 self._alert_log = self._alert_log[-500:]
 
         return {
-            "alert_id":   alert["id"],
-            "server_id":  server_id,
-            "decision":   dec,
-            "severity":   alert["severity"],
+            "alert_id":    alert["id"],
+            "server_id":   server_id,
+            "decision":    dec,
+            "severity":    alert["severity"],
+            "twilio_sent": twilio_sent,
             "slack_sent":  slack_sent,
             "email_sent":  email_sent,
             "dry_run":     dry_run,
@@ -478,6 +556,10 @@ class AlertSystem:
         Prints to console with timing for latency measurement.
         """
         t0 = time.time()
+        generated_at = alert.get("timestamp", "unknown")
+        send_started_at = datetime.now(timezone.utc)
+        print(f"[EMAIL] Generated at: {generated_at}")
+        print(f"[EMAIL] Send attempt started at: {send_started_at.isoformat()}")
         print(f"[EMAIL] Sending to {email_cfg['to']}...")
 
         for attempt in range(1, MAX_RETRIES + 1):
@@ -486,20 +568,23 @@ class AlertSystem:
             duration_ms = int((time.time() - t_attempt) * 1000)
             if success:
                 total_ms = int((time.time() - t0) * 1000)
+                delivery_ms = (datetime.now(timezone.utc) - send_started_at).total_seconds() * 1000
                 with self._lock:
                     self._email_sent += 1
                 logger.info(f"Email alert sent for {alert['server_id']} ({total_ms}ms total)")
-                print(f"[EMAIL] ✅ Sent successfully to {email_cfg['to']} for {alert['server_name']} ({total_ms}ms)")
+                print(f"[EMAIL] Sent in {delivery_ms:.0f}ms")
+                self._record_timeline("EMAIL_SENT", alert.get("server_id", "unknown"), f"{delivery_ms:.0f}ms delay")
                 return
             if attempt < MAX_RETRIES:
                 wait = 0.5 * (2 ** (attempt - 1))  # 0.5s, 1s, 2s
                 logger.warning(f"Email failed (attempt {attempt}/{MAX_RETRIES}, {duration_ms}ms) — retry in {wait:.1f}s")
-                print(f"[EMAIL] ⚠ Attempt {attempt}/{MAX_RETRIES} failed ({duration_ms}ms) — retrying in {wait:.1f}s...")
+                print(f"[EMAIL] Attempt {attempt}/{MAX_RETRIES} failed ({duration_ms}ms) — retrying in {wait:.1f}s...")
                 time.sleep(wait)
             else:
                 total_ms = int((time.time() - t0) * 1000)
                 logger.error(f"Email failed after {MAX_RETRIES} attempts for {alert['server_id']} ({total_ms}ms) — falling back to DRY-RUN")
-                print(f"[EMAIL] ❌ Failed after {MAX_RETRIES} attempts for {alert['server_name']} ({total_ms}ms) — falling back to DRY-RUN")
+                print(f"[EMAIL] Failed after {MAX_RETRIES} attempts for {alert['server_name']} ({total_ms}ms) — falling back to DRY-RUN")
+                self._record_timeline("EMAIL_FAILED", alert.get("server_id", "unknown"), f"Failed after {MAX_RETRIES} attempts")
                 self._dry_run_log(alert)
                 with self._lock:
                     self._fail_count += 1
@@ -511,7 +596,7 @@ class AlertSystem:
         """
         try:
             msg = build_email(alert, smtp_user=email_cfg["user"], email_to=email_cfg["to"])
-            with smtplib.SMTP(email_cfg["host"], email_cfg["port"], timeout=10) as server:
+            with smtplib.SMTP(email_cfg["host"], email_cfg["port"], timeout=5) as server:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()
@@ -520,7 +605,113 @@ class AlertSystem:
             return True
         except Exception as e:
             logger.error(f"SMTP error: {e}")
-            print(f"[EMAIL] ❌ SMTP error: {e}")
+            print(f"[EMAIL] SMTP error: {e}")
+            return False
+
+    # ── TWILIO DELIVERY (FIX 4 — phone call for ESCALATE) ──
+
+    @staticmethod
+    def _has_twilio() -> bool:
+        """Check if all Twilio env vars are set. Read at call time."""
+        return all([
+            os.getenv("TWILIO_ACCOUNT_SID"),
+            os.getenv("TWILIO_AUTH_TOKEN"),
+            os.getenv("TWILIO_FROM_NUMBER"),
+            os.getenv("TWILIO_TO_NUMBER"),
+        ])
+
+    def _send_twilio_async(self, alert: dict):
+        """Non-blocking: runs Twilio call in background thread."""
+        t = threading.Thread(
+            target=self._send_twilio_call_with_retry,
+            args=(alert,),
+            daemon=True,
+        )
+        t.start()
+
+    def _send_twilio_call_with_retry(self, alert: dict):
+        """
+        3 attempts with 1s/2s exponential backoff.
+        First attempt immediate — no sleep before first try.
+        Falls back to email if all retries fail.
+        """
+        server_id = alert.get("server_id", "unknown")
+        for attempt in range(1, MAX_RETRIES + 1):
+            success = self._send_twilio_call(alert)
+            if success:
+                with self._lock:
+                    self._twilio_sent += 1
+                return
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BASE_SECONDS * (2 ** (attempt - 1))  # 1s, 2s
+                print(f"[TWILIO] Attempt {attempt}/{MAX_RETRIES} failed — retrying in {wait:.0f}s...")
+                time.sleep(wait)
+            else:
+                print(f"[TWILIO] Failed after {MAX_RETRIES} attempts for {alert.get('server_name', server_id)}")
+                self._record_timeline("TWILIO_FAILED", alert.get("server_id"), f"Failed after {MAX_RETRIES} attempts")
+                print(f"[TWILIO] Falling back to email...")
+                # Graceful fallback to email
+                email_cfg = self._get_email_config()
+                if email_cfg:
+                    self._send_email_with_retry(alert, email_cfg)
+                else:
+                    self._dry_run_log(alert)
+                with self._lock:
+                    self._fail_count += 1
+
+    def _send_twilio_call(self, alert: dict) -> bool:
+        """
+        Attempt a single Twilio outbound call.
+        Reads env vars inside function body (not at import time).
+        Uses TwiML <Say voice='alice'> to speak the alert message.
+        """
+        try:
+            account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+            auth_token  = os.getenv("TWILIO_AUTH_TOKEN")
+            from_number = os.getenv("TWILIO_FROM_NUMBER")
+            to_number   = os.getenv("TWILIO_TO_NUMBER")
+
+            if not all([account_sid, auth_token, from_number, to_number]):
+                print("[TWILIO] Missing env vars — cannot place call")
+                return False
+
+            print(f"[TWILIO] Debug: Auth Token Length: {len(auth_token) if auth_token else 0}")
+            print(f"[TWILIO] Starting call from {from_number} to {to_number}")
+
+            client = TwilioClient(account_sid, auth_token)
+
+            server_name = alert.get("server_name", "Unknown")
+            cpu         = alert.get("cpu", 0)
+            decision    = alert.get("decision", "ESCALATE")
+            action      = alert.get("action", "Immediate intervention required")
+
+            twiml_message = (
+                f"<Response><Say voice='alice'>"
+                f"CrashGuard critical escalation. "
+                f"Decision: {decision}. "
+                f"Server {server_name} is under critical load. "
+                f"CPU usage is {cpu:.0f} percent. "
+                f"Immediate intervention required."
+                f"</Say></Response>"
+            )
+
+            call = client.calls.create(
+                twiml=twiml_message,
+                from_=from_number,
+                to=to_number,
+            )
+
+            print(f"[TWILIO] SID: {call.sid}")
+            print(f"[TWILIO] Call initiated — SID: {call.sid}")
+            logger.info(f"Twilio call initiated for {server_name} — SID: {call.sid}")
+            self._record_timeline("CALL_TRIGGERED", alert.get("server_id", "unknown"), f"SID: {call.sid}")
+            return True
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[TWILIO] Failed: {e}")
+            logger.error(f"Twilio call error: {e}")
             return False
 
     # ── DRY-RUN FALLBACK ────────────────────────────────
@@ -536,26 +727,36 @@ class AlertSystem:
             f"{alert['reason'][:120]}"
         )
 
-    # ── STATS (FIX 2 — includes suppression breakdown) ──
+    # ── STATS (FIX 2 — includes suppression breakdown + FIX 4 Twilio) ──
 
     def get_stats(self) -> dict:
         with self._lock:
             total_suppressed_cooldown = sum(self._suppressed_by_cooldown.values())
             total_suppressed_severity = sum(self._suppressed_by_severity.values())
             email_cfg = self._get_email_config()
+            twilio_ok = TWILIO_AVAILABLE and self._has_twilio()
             return {
+                "sent":                    self._sent_count,
                 "slack_sent":              self._sent_count,
                 "email_sent":              self._email_sent,
+                "twilio_sent":             self._twilio_sent,
                 "failed":                  self._fail_count,
                 "dry_runs":                self._dry_run_count,
                 "slack_enabled":           self._slack_enabled,
                 "email_enabled":           bool(email_cfg),
+                "twilio_enabled":          twilio_ok,
                 "total_alerts":            len(self._alert_log),
                 # FIX 2 — Suppression breakdown
                 "suppressed_by_cooldown":  total_suppressed_cooldown,
                 "suppressed_by_severity":  total_suppressed_severity,
                 "total_suppressed":        total_suppressed_cooldown + total_suppressed_severity,
                 "suppressed_per_server":   dict(self._suppressed_by_cooldown),
+                # FIX 4 — Channel availability
+                "channels": {
+                    "twilio": twilio_ok,
+                    "email":  bool(email_cfg),
+                    "slack":  self._slack_enabled,
+                },
             }
 
     def get_alert_log(self) -> list[dict]:
@@ -573,23 +774,35 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
     )
 
-    print("CrashGuard AI — Alert System Test")
-    print("─" * 55)
+    import sys
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+    print("CrashGuard AI -- Alert System Test")
+    print("-" * 55)
 
     # Show env var status (read at call time)
     cfg = AlertSystem._get_email_config()
-    print(f"  SMTP_USER  = {os.getenv('SMTP_USER', '(not set)')}")
-    print(f"  SMTP_PASS  = {'****' + os.getenv('SMTP_PASS', '')[-4:] if os.getenv('SMTP_PASS') else '(not set)'}")
-    print(f"  ALERT_EMAIL= {os.getenv('ALERT_EMAIL', '(not set)')}")
-    print(f"  Email ready: {bool(cfg)}")
+    print(f"  SMTP_USER       = {os.getenv('SMTP_USER', '(not set)')}")
+    print(f"  SMTP_PASS       = {'****' + os.getenv('SMTP_PASS', '')[-4:] if os.getenv('SMTP_PASS') else '(not set)'}")
+    print(f"  ALERT_EMAIL     = {os.getenv('ALERT_EMAIL', '(not set)')}")
+    print(f"  Email ready     : {bool(cfg)}")
+    print()
+    print(f"  TWILIO_SID      = {os.getenv('TWILIO_ACCOUNT_SID', '(not set)')[:10]}..." if os.getenv('TWILIO_ACCOUNT_SID') else "  TWILIO_SID      = (not set)")
+    print(f"  TWILIO_TOKEN    = {'****' if os.getenv('TWILIO_AUTH_TOKEN') else '(not set)'}")
+    print(f"  TWILIO_FROM     = {os.getenv('TWILIO_FROM_NUMBER', '(not set)')}")
+    print(f"  TWILIO_TO       = {os.getenv('TWILIO_TO_NUMBER', '(not set)')}")
+    print(f"  Twilio library  : {'INSTALLED' if TWILIO_AVAILABLE else 'NOT INSTALLED'}")
+    print(f"  Twilio ready    : {TWILIO_AVAILABLE and AlertSystem._has_twilio()}")
     print()
 
     alerts = AlertSystem()
     stats = alerts.get_stats()
-    print(f"  Slack: {'LIVE' if stats['slack_enabled'] else 'DISABLED'}")
-    print(f"  Email: {'LIVE' if stats['email_enabled'] else 'DISABLED'}")
+    print(f"  Slack:  {'LIVE' if stats['slack_enabled'] else 'DISABLED'}")
+    print(f"  Email:  {'LIVE' if stats['email_enabled'] else 'DISABLED'}")
+    print(f"  Twilio: {'LIVE' if stats.get('twilio_enabled') else 'DISABLED'}")
+    print()
 
-    # Simulate an ESCALATE decision
+    # Simulate an ESCALATE decision (triggers Twilio if configured)
     mock_decision = {
         "server_id": "server_e",
         "server_name": "Server E — Critical",
@@ -607,14 +820,27 @@ if __name__ == "__main__":
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
     }
 
+    print("  Testing ESCALATE decision...")
     result = alerts._process_one("server_e", mock_decision)
     if result:
         print(f"\n  Alert fired: {result}")
     else:
         print("\n  Alert suppressed (cooldown)")
 
-    # Wait for background email thread to finish
-    time.sleep(8)
+    # Wait for background threads (Twilio call or email) to finish
+    print("\n  Waiting for background delivery...")
+    time.sleep(12)
 
     print(f"\n  Stats: {alerts.get_stats()}")
     print("\n✅ Alert system test complete.")
+
+    test_alert = {
+        "server_name": "Server E",
+        "decision": "ESCALATE",
+        "current_cpu": 91.5,
+        "action": "Immediate intervention required",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+    sender = AlertSystem()
+    sender._send_twilio_call(test_alert)
