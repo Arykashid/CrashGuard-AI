@@ -40,6 +40,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
 from typing import Optional
+import random
 
 # Safe Twilio import — graceful degradation if not installed
 try:
@@ -70,8 +71,12 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 #       _get_email_config() at function-call time so that env vars
 #       set after this module is imported are still picked up.
 
-# FIX 2 — Cooldown set to 5 minutes (300s) per server per channel
-ALERT_COOLDOWN_SECONDS = 300  # 5 minutes per server
+COOLDOWN_BY_DECISION = {
+    "MONITOR": 300,
+    "SCALE_READY": 300,
+    "SCALE": 120,
+    "ESCALATE": 180,
+}
 MAX_RETRIES            = 3
 RETRY_BASE_SECONDS     = 1.0
 
@@ -101,7 +106,7 @@ SEVERITY_COLOR = {
 
 # FIX 3 — Email fires for CRITICAL and HIGH severity (ESCALATE + SCALE) + RESTART/MONITOR
 ALERTABLE_DECISIONS = {"ESCALATE", "SCALE", "SCALE_READY", "RESTART", "MONITOR"}
-EMAIL_DECISIONS     = {"ESCALATE", "SCALE", "RESTART", "MONITOR"}
+EMAIL_DECISIONS     = {"ESCALATE", "SCALE"}
 
 # FIX 2 — Suppression sanity cap per session
 MAX_SUPPRESSIONS_PER_SESSION = 50
@@ -120,6 +125,11 @@ class ChannelCooldown:
         self._cooldown = cooldown_seconds
         self._last: dict[str, float] = {}
 
+    def can_send_with_cooldown(self, server_id: str, cooldown: int) -> bool:
+        with self._lock:
+            elapsed = time.time() - self._last.get(server_id, 0.0)
+            return elapsed >= cooldown
+
     def can_send(self, server_id: str) -> bool:
         with self._lock:
             elapsed = time.time() - self._last.get(server_id, 0.0)
@@ -129,10 +139,10 @@ class ChannelCooldown:
         with self._lock:
             self._last[server_id] = time.time()
 
-    def seconds_remaining(self, server_id: str) -> int:
+    def seconds_remaining(self, server_id: str, cooldown: int) -> int:
         with self._lock:
             elapsed = time.time() - self._last.get(server_id, 0.0)
-            return max(0, int(self._cooldown - elapsed))
+            return max(0, int(cooldown - elapsed))
 
 
 # ─────────────────────────────────────────────
@@ -234,25 +244,21 @@ def build_email(alert: dict, smtp_user: str, email_to: str) -> MIMEMultipart:
     smtp_user and email_to are passed in explicitly so we never
     depend on module-level variables.
     """
-    subject = f"[CrashGuard] {alert['decision']} — {alert['server_name']} — CPU {alert['cpu']:.1f}%"
+    if alert['decision'] == "ESCALATE":
+        subject = f"[CrashGuard][ESCALATE] {alert['server_name']} — Immediate Attention Required"
+    else:
+        subject = f"[CrashGuard][{alert['decision']}] {alert['server_name']} — CPU {alert['cpu']:.1f}%"
 
     body = (
         "CrashGuard AI Alert\n"
         "===================\n"
         f"Server:     {alert['server_name']}\n"
-        f"Decision:   {alert['decision']}\n"
-        f"Severity:   {alert['severity']}\n"
         f"Current CPU: {alert['cpu']:.1f}%\n"
         f"Predicted:  {alert['predicted_cpu']:.1f}%\n"
-        f"Confidence: {alert['confidence']:.0%}\n"
         f"Crash Risk: {alert['risk']:.0%}\n"
-        "\n"
-        f"Reason: {alert['reason']}\n"
-        f"Action: {alert['action']}\n"
-        "\n"
-        f"Alert Generated: {alert['timestamp']}\n"
-        f"Email Sent:      {datetime.now(timezone.utc).isoformat(timespec='milliseconds')}\n"
-        f"Delivery Delay:  {int((datetime.now(timezone.utc) - datetime.fromisoformat(alert['timestamp'])).total_seconds())}s\n"
+        f"Decision:   {alert['decision']}\n"
+        f"Timestamp:  {alert['timestamp']}\n"
+        f"Action:     {alert['action']}\n"
         "\n"
         "-- CrashGuard AI Autonomous Decision System\n"
     )
@@ -263,6 +269,104 @@ def build_email(alert: dict, smtp_user: str, email_to: str) -> MIMEMultipart:
     msg["To"]      = email_to
     msg.attach(MIMEText(body, "plain"))
     return msg
+
+
+# ─────────────────────────────────────────────
+# DYNAMIC VOICE INTELLIGENCE BUILDER
+# ─────────────────────────────────────────────
+
+VOICE_INTROS = [
+    "This is CrashGuard AI.",
+    "CrashGuard automated operations.",
+    "CrashGuard infrastructure monitor."
+]
+
+VOICE_SEV_95 = [
+    "Severe infrastructure instability detected on",
+    "Critical resource exhaustion imminent on",
+    "Major operational disruption detected on"
+]
+
+VOICE_SEV_90 = [
+    "Critical incident detected on",
+    "High severity alert for",
+    "Urgent load anomaly detected on"
+]
+
+VOICE_SEV_80 = [
+    "Elevated system load detected on",
+    "Unusual resource consumption observed on",
+    "Significant load increase detected on"
+]
+
+VOICE_RECOVERY = [
+    "load is beginning to stabilize after automated intervention",
+    "is showing signs of recovery",
+    "pressure is currently decreasing"
+]
+
+VOICE_CONTEXT_RISING = [
+    "Load continues to rise rapidly",
+    "System pressure is escalating quickly"
+]
+
+VOICE_ACT_ESCALATE = [
+    "Immediate engineer investigation is recommended.",
+    "Manual intervention may now be required.",
+    "On-call escalation has been initiated.",
+    "Human review is advised."
+]
+
+VOICE_ACT_SCALE = [
+    "Automatic scaling has already been triggered",
+    "Automatic scaling procedures were successfully initiated",
+    "Autonomous scaling procedures were initiated"
+]
+
+VOICE_ACT_MONITOR = [
+    "System stability is currently being monitored.",
+    "Monitoring remains active.",
+    "System remains under observation."
+]
+
+def build_voice_message(decision_data: dict) -> str:
+    """Generate dynamic, operationally realistic voice message."""
+    intro = random.choice(VOICE_INTROS)
+    server_name = decision_data.get("server_name", "Unknown Server")
+    cpu = round(float(decision_data.get("cpu", 0)))
+    decision = decision_data.get("decision", "ESCALATE")
+    trend = decision_data.get("trend", "stable")
+    
+    if trend in ("rapidly_falling", "falling") or decision == "MONITOR":
+        sev = f"{server_name} {random.choice(VOICE_RECOVERY)}."
+        ctx = "CPU utilization has dropped below critical thresholds."
+        act = random.choice(VOICE_ACT_MONITOR)
+        return f"{intro} {sev} {ctx} {act}"
+
+    if cpu >= 95:
+        sev = f"{random.choice(VOICE_SEV_95)} {server_name}."
+    elif cpu >= 90:
+        sev = f"{random.choice(VOICE_SEV_90)} {server_name}."
+    else:
+        sev = f"{random.choice(VOICE_SEV_80)} {server_name}."
+        
+    if trend in ("rapidly_rising", "rising"):
+        ctx = f"{random.choice(VOICE_CONTEXT_RISING)}. CPU usage is at {cpu} percent."
+    else:
+        ctx = f"CPU usage is currently at {cpu} percent."
+        
+    if decision == "ESCALATE":
+        act1 = random.choice(VOICE_ACT_SCALE)
+        act2 = random.choice(VOICE_ACT_ESCALATE)
+        act = f"{act1}, but instability persists. {act2}"
+    elif decision == "SCALE":
+        act1 = random.choice(VOICE_ACT_SCALE)
+        act2 = random.choice(VOICE_ACT_MONITOR)
+        act = f"{act1}. {act2}"
+    else:
+        act = random.choice(VOICE_ACT_MONITOR)
+        
+    return f"{intro} {sev} {ctx} {act}"
 
 
 # ─────────────────────────────────────────────
@@ -289,7 +393,7 @@ class AlertSystem:
         self._slack_enabled   = bool(SLACK_WEBHOOK_URL)
         # NOTE: email_enabled is checked dynamically at send time via _get_email_config()
         # FIX 2 — Single cooldown tracker shared across channels (5 min per server)
-        self._cooldown        = ChannelCooldown(ALERT_COOLDOWN_SECONDS)
+        self._cooldown        = ChannelCooldown(300)
         self._lock            = threading.Lock()
         self._sent_count      = 0
         self._fail_count      = 0
@@ -355,6 +459,7 @@ class AlertSystem:
 
     def _process_one(self, server_id: str, decision: dict) -> Optional[dict]:
         """Process single decision through alert pipeline."""
+        generated_at = decision.get("timestamp", datetime.now(timezone.utc).isoformat())
         dec = decision.get("decision", "STABLE")
         severity = SEVERITY_MAP.get(dec, "INFO")
         server_name = decision.get('server_name', server_id)
@@ -379,20 +484,23 @@ class AlertSystem:
         is_duplicate = (dec == last_dec)
 
         # FIX 2 — Step 1: Check cooldown FIRST (before severity)
-        if not self._cooldown.can_send(server_id):
+        cooldown = COOLDOWN_BY_DECISION.get(dec, 300)
+        if not self._cooldown.can_send_with_cooldown(server_id, cooldown):
             if not is_duplicate:
                 print(f"[COOLDOWN] Bypassed for {server_name} — decision changed from {last_dec} to {dec}")
                 self._record_timeline("COOLDOWN_BYPASSED", server_id, f"Changed to {dec}")
             else:
-                remaining = self._cooldown.seconds_remaining(server_id)
-                print(f"[EMAIL] Suppressed by cooldown for {server_name}")
-                print(f"[EMAIL] Cooldown remaining: {remaining}s")
+                remaining = self._cooldown.seconds_remaining(server_id, cooldown)
+                print(f"[COOLDOWN_SUPPRESSED] server={server_id} decision={dec} remaining={remaining}s")
                 logger.debug(f"Alert suppressed for {server_id} — cooldown {remaining}s remaining")
                 self._record_timeline("COOLDOWN_SUPPRESSED", server_id, f"{remaining}s remaining")
                 with self._lock:
                     self._suppressed_by_cooldown[server_id] = self._suppressed_by_cooldown.get(server_id, 0) + 1
                     self._total_suppressed_session += 1
                 return None
+
+        if is_duplicate and dec == "ESCALATE":
+            print(f"[TWILIO_REPEAT] server={server_id} reason=incident_unresolved")
 
         # FIX 2 — Sanity cap: if we've suppressed > 50 this session, log warning
         if self._total_suppressed_session > MAX_SUPPRESSIONS_PER_SESSION:
@@ -413,9 +521,16 @@ class AlertSystem:
 
         # Layer 0: Twilio phone call for ESCALATE (FIX 4)
         current_cpu = alert.get("cpu", 0)
-        if (dec == "ESCALATE" or (dec == "SCALE" and current_cpu >= 80)) and TWILIO_AVAILABLE and self._has_twilio():
+        if dec in ("MONITOR", "SCALE_READY", "STABLE", "RESTART") and dec not in EMAIL_DECISIONS:
+            print(f"[ROUTER] decision={dec} channel=DASHBOARD_ONLY")
+        elif dec == "SCALE":
+            print(f"[ROUTER] decision={dec} channel=EMAIL")
+        elif dec == "ESCALATE":
+            print(f"[ROUTER] decision={dec} channel=TWILIO+EMAIL")
+
+        if dec == "ESCALATE" and TWILIO_AVAILABLE and self._has_twilio():
             try:
-                print(f"[ROUTER] selected_channel=twilio server={server_id}")
+                print(f"[TWILIO_TRIGGER] server={server_id}")
                 self._send_twilio_async(alert)
                 twilio_sent = True
             except Exception as e:
@@ -438,7 +553,7 @@ class AlertSystem:
             if email_cfg:
                 try:
                     print(f"[ROUTER] selected_channel=email server={server_id}")
-                    self._send_email_async(alert, email_cfg)
+                    self._send_email_async(alert, email_cfg, generated_at)
                     email_sent = True
                 except Exception as e:
                     logger.error(f"Email send failed for {server_id}: {e}")
@@ -541,25 +656,22 @@ class AlertSystem:
 
     # ── EMAIL DELIVERY (FIX 3 — non-blocking with retry) ──
 
-    def _send_email_async(self, alert: dict, email_cfg: dict):
+    def _send_email_async(self, alert: dict, email_cfg: dict, generated_at: str):
         """Non-blocking: runs email delivery in background thread."""
         t = threading.Thread(
             target=self._send_email_with_retry,
-            args=(alert, email_cfg),
+            args=(alert, email_cfg, generated_at),
             daemon=True,
         )
         t.start()
 
-    def _send_email_with_retry(self, alert: dict, email_cfg: dict):
+    def _send_email_with_retry(self, alert: dict, email_cfg: dict, generated_at: str):
         """
         3 attempts with 0.5s/1s/2s exponential backoff.
         Prints to console with timing for latency measurement.
         """
         t0 = time.time()
-        generated_at = alert.get("timestamp", "unknown")
-        send_started_at = datetime.now(timezone.utc)
         print(f"[EMAIL] Generated at: {generated_at}")
-        print(f"[EMAIL] Send attempt started at: {send_started_at.isoformat()}")
         print(f"[EMAIL] Sending to {email_cfg['to']}...")
 
         for attempt in range(1, MAX_RETRIES + 1):
@@ -568,12 +680,11 @@ class AlertSystem:
             duration_ms = int((time.time() - t_attempt) * 1000)
             if success:
                 total_ms = int((time.time() - t0) * 1000)
-                delivery_ms = (datetime.now(timezone.utc) - send_started_at).total_seconds() * 1000
                 with self._lock:
                     self._email_sent += 1
                 logger.info(f"Email alert sent for {alert['server_id']} ({total_ms}ms total)")
-                print(f"[EMAIL] Sent in {delivery_ms:.0f}ms")
-                self._record_timeline("EMAIL_SENT", alert.get("server_id", "unknown"), f"{delivery_ms:.0f}ms delay")
+                print(f"[EMAIL_SENT] decision={alert['decision']} latency_ms={total_ms}")
+                self._record_timeline("EMAIL_SENT", alert.get("server_id", "unknown"), f"{total_ms}ms delay")
                 return
             if attempt < MAX_RETRIES:
                 wait = 0.5 * (2 ** (attempt - 1))  # 0.5s, 1s, 2s
@@ -653,7 +764,8 @@ class AlertSystem:
                 # Graceful fallback to email
                 email_cfg = self._get_email_config()
                 if email_cfg:
-                    self._send_email_with_retry(alert, email_cfg)
+                    generated_at = alert.get("timestamp", "unknown")
+                    self._send_email_with_retry(alert, email_cfg, generated_at)
                 else:
                     self._dry_run_log(alert)
                 with self._lock:
@@ -681,17 +793,12 @@ class AlertSystem:
             client = TwilioClient(account_sid, auth_token)
 
             server_name = alert.get("server_name", "Unknown")
-            cpu         = alert.get("cpu", 0)
-            decision    = alert.get("decision", "ESCALATE")
-            action      = alert.get("action", "Immediate intervention required")
+
+            spoken_text = build_voice_message(alert)
 
             twiml_message = (
                 f"<Response><Say voice='alice'>"
-                f"CrashGuard critical escalation. "
-                f"Decision: {decision}. "
-                f"Server {server_name} is under critical load. "
-                f"CPU usage is {cpu:.0f} percent. "
-                f"Immediate intervention required."
+                f"{spoken_text}"
                 f"</Say></Response>"
             )
 
@@ -701,8 +808,7 @@ class AlertSystem:
                 to=to_number,
             )
 
-            print(f"[TWILIO] SID: {call.sid}")
-            print(f"[TWILIO] Call initiated — SID: {call.sid}")
+            print(f"[TWILIO_SUCCESS] sid={call.sid}")
             logger.info(f"Twilio call initiated for {server_name} — SID: {call.sid}")
             self._record_timeline("CALL_TRIGGERED", alert.get("server_id", "unknown"), f"SID: {call.sid}")
             return True

@@ -167,8 +167,9 @@ class AlertRegistry:
                 created_at = datetime.fromisoformat(alert["timestamp"])
                 elapsed = (now - created_at).total_seconds()
                 
-                # Prevent duplicate alerts within rolling time window (e.g. 2 min)
-                if decision == alert["decision"] and elapsed < 300:
+                # Prevent duplicate alerts within rolling time window
+                dedup_window = 30 if decision == "ESCALATE" else 120
+                if decision == alert["decision"] and elapsed < dedup_window:
                     return {"alert": False, "reason": "deduplicated", "incident_id": alert["id"], "transition": None}
                 
                 # If we've passed the deduplication window or decision changed, transition state
@@ -524,6 +525,7 @@ class DecisionEngine:
         self._last_decisions:      dict[str, dict] = {}
         self._last_decision_str:   dict[str, str]  = {}
         self._escalation_start:    dict[str, float] = {}
+        self._scale_start_time:    dict[str, float] = {}
         self._session_start        = time.time()
         
         # CPU tracking for sustained time-based rules (120s rolling window)
@@ -822,6 +824,21 @@ class DecisionEngine:
             self._last_action_time[server_id] = now
             
         self._last_decision_str[server_id] = decision
+
+        # Track when SCALE first fired
+        if decision == "SCALE" and last_decision != "SCALE":
+            self._scale_start_time[server_id] = time.time()
+        elif decision != "SCALE":
+            self._scale_start_time.pop(server_id, None)
+
+        # Promote SCALE → ESCALATE after 15 seconds
+        if decision == "SCALE":
+            scale_elapsed = time.time() - self._scale_start_time.get(server_id, time.time())
+            if scale_elapsed >= 15:
+                decision = "ESCALATE"
+                print(f"[PROMOTION] server={server_id} reason=SCALE_persisted_15s new_decision=ESCALATE")
+
+        print(f"[DECISION] server={server_id} cpu={current_cpu:.1f} risk={crash_risk:.0%} spikes={spike_count} decision={decision}")
 
         # ── ACTION FEEDBACK — track before/after CPU ───────────
         self._record_action_feedback(server_id, current_cpu, decision)
