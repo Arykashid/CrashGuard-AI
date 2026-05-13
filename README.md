@@ -3,15 +3,35 @@
 ### Autonomous CPU Workload Forecasting and Infrastructure Decision System
 
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)
-![Flask](https://img.shields.io/badge/Flask-Backend-black?logo=flask)
+![Flask](https://img.shields.io/badge/Flask-3.0-black?logo=flask)
 ![TensorFlow](https://img.shields.io/badge/TensorFlow-LSTM-orange?logo=tensorflow)
-![XGBoost](https://img.shields.io/badge/XGBoost-Ensemble-blue?logo=xgboost)
-![Twilio](https://img.shields.io/badge/Twilio-Escalation-red?logo=twilio)
+![XGBoost](https://img.shields.io/badge/XGBoost-Ensemble-blue)
+![Twilio](https://img.shields.io/badge/Twilio-Voice_Escalation-red?logo=twilio)
+![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
 
 ---
 
-CrashGuard predicts CPU failures before they happen and responds autonomously — scaling infrastructure, restarting services, or escalating to on-call engineers — without waiting for human intervention.
+CrashGuard predicts CPU overload events before they happen and responds autonomously — scaling infrastructure, restarting services, or escalating to on-call engineers via phone call — without waiting for human intervention.
+
+---
+
+## Screenshots
+
+### Dashboard
+![Dashboard — live decision banner, CPU chart with prediction overlay, fleet status, incident timeline](assets/screenshots/dashboard.png)
+
+### Systems
+![Systems — per-server CPU utilization, trend direction, live decision badges](assets/screenshots/systems.png)
+
+### Alerts
+![Alerts — alert log with decision routing, severity tags, suppression stats](assets/screenshots/alerts.png)
+
+### Models
+![Models — calibration proof, live trust indicators, ensemble pipeline diagram](assets/screenshots/models.png)
+
+### Predictions
+![Predictions — per-server forecasts, operational risk scores, recommended actions](assets/screenshots/predictions.png)
 
 ---
 
@@ -23,13 +43,13 @@ Raw CPU Telemetry (2s tick rate)
          ▼
 ┌─────────────────────┐
 │   Feature Engine     │  15 signals: lags, rolling stats,
-│                      │  cyclical time, delta, spike_flag
+│                      │  cyclical time encoding, delta, spike_flag
 └──────────┬──────────┘
            │
            ▼
 ┌──────────────────────────────┐
-│   LSTM + XGBoost Ensemble    │  MCDropout uncertainty bounds
-│   60/40 dynamic weighting    │  Temperature scaling T=9.5518
+│   LSTM + XGBoost Ensemble    │  MC Dropout uncertainty bounds
+│   60/40 dynamic weighting    │  Temperature scaling T = 9.5518
 └──────────┬───────────────────┘
            │
            ▼
@@ -47,18 +67,18 @@ Autoscale/Restart    📞 Twilio Call
 
 ---
 
-## Model Metrics
+## Model Performance
 
 | Metric | Value |
 |---|---|
 | Ensemble RMSE | 0.1578 |
 | XGBoost RMSE | 0.1337 |
 | LSTM RMSE | 0.2328 |
-| DM Test p-value | 0.0086 |
-| 80% CI Coverage | 80.0% (perfectly calibrated) |
-| Calibration Temperature | T = 9.5518 |
-| Training Samples | ~60,000 Google Cluster records |
-| Features | 15 engineered signals |
+| Diebold-Mariano p-value | 0.0086 (ensemble significantly outperforms individual models) |
+| 80% CI Coverage | 80.0% (calibrated — matches claimed interval) |
+| Calibration Temperature | T = 9.5518 (Platt scaling) |
+| Training Data | ~60,000 records from Google Cluster Workload Traces |
+| Engineered Features | 15 signals per timestep |
 | MC Dropout Samples | 15 forward passes per prediction |
 
 ---
@@ -75,10 +95,10 @@ Autoscale/Restart    📞 Twilio Call
 
 **Key properties:**
 
-- **Graduated escalation:** STABLE → MONITOR → SCALE → ESCALATE (no skipping)
-- **Hysteresis:** prevents decision flapping within 60 seconds
-- **Confidence gating:** >70% confidence for autonomous action, <50% forces human escalation
-- **Hard override:** CPU ≥ 90% bypasses all gates and forces ESCALATE immediately
+- **Graduated escalation:** STABLE → MONITOR → SCALE → ESCALATE (no level skipping)
+- **Hysteresis:** prevents decision flapping within 60-second windows
+- **Confidence gating:** >70% model confidence for autonomous action; <50% forces human review
+- **Hard override:** CPU ≥ 90% bypasses all gates → immediate ESCALATE
 
 ---
 
@@ -92,29 +112,29 @@ Autoscale/Restart    📞 Twilio Call
 | **MONITOR** | Dashboard only | — |
 | **STABLE** | No alert | — |
 
+All channels include per-server cooldown enforcement to prevent alert fatigue. Alerts are suppressed (not lost) during cooldown — suppression counts are visible on the Alerts page.
+
 ---
 
 ## Dashboard Pages
 
-1. **Dashboard** — Live decision banner, CPU chart with prediction zone, incident timeline, fleet status, system health
-2. **Systems** — Per-server CPU bars, trend labels, CRITICAL RISK badges, live decision badges
-3. **Alerts** — Evidence at detection, escalation paths, fallback branches, root cause hypothesis
-4. **Models** — Calibration proof (80% CI), trust indicators (PASS/WARN/FAIL), pipeline diagram
-5. **Predictions** — Per-server forecasts, CI ranges, crash risk scores, recommended actions
+1. **Dashboard** — Live decision banner, CPU chart with prediction overlay, incident timeline, fleet CPU bars, system health panel
+2. **Systems** — Per-server CPU utilization, trend direction, decision badges, model source
+3. **Alerts** — Alert log with severity tags, suppression stats, cooldown/deduplication metrics
+4. **Models** — Calibration proof (80% CI bar), live trust indicators (PASS/WARN/FAIL), end-to-end pipeline diagram
+5. **Predictions** — Per-server forecasts, confidence intervals, operational risk scores, recommended actions
 
 ---
 
 ## Quick Start
 
-### Option 1: Direct Python
+### Option 1: Python
 
 ```bash
 git clone https://github.com/Arykashid/CrashGuard-AI
 cd CrashGuard-AI
 pip install -r requirements.txt
-cp .env.example .env
-# Fill in .env with your credentials
-set DEMO_MODE=1   # Windows
+cp .env.example .env    # fill in credentials (optional — runs in dry-run mode without them)
 python app.py
 # Open http://localhost:5000
 ```
@@ -122,9 +142,10 @@ python app.py
 ### Option 2: Docker (recommended)
 
 ```bash
-cp .env.example .env
-# Fill in .env with your credentials
-docker-compose up
+git clone https://github.com/Arykashid/CrashGuard-AI
+cd CrashGuard-AI
+cp .env.example .env    # fill in credentials
+docker-compose up --build
 # Open http://localhost:5000
 ```
 
@@ -132,15 +153,15 @@ docker-compose up
 
 ## Demo Walkthrough
 
-1. Open `http://localhost:5000` — wait 90 seconds for model warmup
-2. Dashboard shows all 5 servers with live CPU bars
-3. Click **Burst C** in Demo Controls panel
-4. Watch hero banner escalate: **MONITOR → RESTART → SCALE → ESCALATE**
-5. Terminal shows `[TWILIO] ✅ Call initiated` — phone rings within 10 seconds
-6. Go to **Alerts** page — see Evidence at Detection, Thresholds Crossed, Fallback branches
-7. Go to **Predictions** page — watch crash risk rise then fall
-8. Click **Normalize A** — system recovers autonomously
-9. Go to **Models** page — verify calibration proof and trust indicators
+1. Open `http://localhost:5000` — wait ~90 seconds for LSTM model warmup
+2. Dashboard shows all 5 servers with live CPU bars and decisions
+3. Click **Burst C** in the Demo Controls panel (bottom-right)
+4. Watch the hero banner escalate: **STABLE → MONITOR → SCALE → ESCALATE**
+5. Terminal logs show `[TWILIO] ✅ Call initiated` — phone rings within 10 seconds
+6. Navigate to **Alerts** — see the alert log with severity, routing, and suppression stats
+7. Navigate to **Predictions** — watch operational risk rise then fall as the server recovers
+8. Click **Normalize A** — system recovers autonomously, decision returns to STABLE
+9. Navigate to **Models** — verify calibration proof and live trust indicators
 
 ---
 
@@ -148,21 +169,24 @@ docker-compose up
 
 ```
 CrashGuard-AI/
-├── app.py                    # Flask backend, API endpoints
-├── server_simulator.py       # 5 server behavior profiles
+├── app.py                    # Flask backend + REST API
+├── server_simulator.py       # 5-server workload simulator
 ├── feature_engine.py         # 15-signal feature pipeline
-├── pipeline.py               # LSTM + XGBoost ensemble
+├── pipeline.py               # LSTM + XGBoost ensemble inference
 ├── decision_engine.py        # Autonomous decision engine v5
 ├── alert_system.py           # Multi-channel alert dispatch
 ├── crashguard_dashboard.html # 5-page SPA dashboard
 ├── assets/
-│   ├── style.css
-│   └── dashboard.js
+│   ├── style.css             # Dashboard styles
+│   ├── dashboard.js          # Dashboard logic
+│   └── screenshots/          # README screenshots
 ├── models/                   # Trained model artifacts
 ├── Dockerfile
 ├── docker-compose.yml
+├── .dockerignore
 ├── .env.example
 ├── requirements.txt
+├── LICENSE
 └── README.md
 ```
 
@@ -172,40 +196,67 @@ CrashGuard-AI/
 
 | Variable | Required | Description |
 |---|---|---|
-| `DEMO_MODE` | No | `1` = stable demo, `0` = live random |
+| `DEMO_MODE` | No | `1` = deterministic demo, `0` = live random. Default: `1` |
 | `TWILIO_ACCOUNT_SID` | No | Twilio account identifier |
 | `TWILIO_AUTH_TOKEN` | No | Twilio authentication token |
-| `TWILIO_FROM_NUMBER` | No | Your Twilio phone number |
-| `TWILIO_TO_NUMBER` | No | On-call engineer number |
-| `SMTP_USER` | No | Gmail address for alerts |
-| `SMTP_PASS` | No | Gmail App Password (16 chars) |
+| `TWILIO_FROM_NUMBER` | No | Twilio phone number (caller) |
+| `TWILIO_TO_NUMBER` | No | On-call engineer phone number |
+| `SMTP_USER` | No | Gmail address for sending alerts |
+| `SMTP_PASS` | No | Gmail App Password (16 characters) |
 | `ALERT_EMAIL` | No | Alert destination email |
+| `SLACK_WEBHOOK_URL` | No | Slack incoming webhook URL |
+
+All alert channels are optional. When credentials are absent, the system runs in **dry-run mode** — decisions are logged to the console but no external notifications are sent.
+
+---
+
+## Cloud Deployment
+
+CrashGuard runs as a single Docker container. Deploy directly from the repository on any platform that supports Docker:
+
+### Render
+
+1. Connect your GitHub repo at [render.com](https://render.com)
+2. Select **Web Service** → **Docker** runtime
+3. Set environment variables in the Render dashboard
+4. Deploy — Render builds from the Dockerfile automatically
+
+### Railway
+
+1. Connect your GitHub repo at [railway.app](https://railway.app)
+2. Railway auto-detects the Dockerfile
+3. Add environment variables in the Railway dashboard
+4. Deploy — accessible via generated URL
+
+**Startup command** (if needed): `python app.py`
+**Port**: `5000`
+**Health endpoint**: `GET /health`
 
 ---
 
 ## Why CrashGuard vs Reactive Monitoring
 
-- **Predictive, not reactive.** Reactive tools (Datadog, Grafana) alert *after* a failure occurs. CrashGuard predicts the failure trajectory 60 seconds ahead and acts *before* impact.
-- **Autonomous response.** No human required for first-response scaling or restart. Mean time to response drops from minutes to seconds.
-- **Self-aware model.** The system exposes prediction reliability in real time and gates autonomous actions when model confidence is low — preventing unsafe interventions.
+- **Predictive, not reactive.** Tools like Datadog and Grafana alert *after* a threshold is breached. CrashGuard forecasts the failure trajectory 60 seconds ahead and acts *before* impact.
+- **Autonomous first-response.** No human required for initial scaling or restart. Mean time to response drops from minutes to seconds.
+- **Self-aware model.** The system exposes prediction reliability in real time and gates autonomous actions when model confidence is low — preventing unsafe automated interventions.
 
 ---
 
 ## Limitations
 
-- Model trained on Google Cluster Workload Traces — performance on workloads with different characteristics may vary.
-- Simulator generates synthetic CPU patterns for demo; production deployment requires real telemetry integration.
-- Trial Twilio account limited to verified phone numbers.
+- Model trained on [Google Cluster Workload Traces](https://github.com/google/cluster-data) — performance on workloads with different characteristics (e.g., GPU-bound, IO-heavy) has not been validated.
+- The 5-server simulator generates synthetic CPU patterns for demonstration. Production deployment requires integration with real telemetry sources (e.g., `psutil`, Prometheus, or cloud provider APIs).
+- Trial Twilio accounts are limited to verified phone numbers only.
 
 ---
 
 ## Future Work
 
 - Real telemetry ingestion via `psutil` or Prometheus scraping
-- PostgreSQL persistence for incident history
-- Kubernetes HPA integration for actual infrastructure scaling
-- Multi-cluster support
-- Model retraining pipeline on live data
+- PostgreSQL persistence for incident history and audit logs
+- Kubernetes HPA integration for live infrastructure scaling
+- Multi-cluster fleet monitoring
+- Online model retraining pipeline on production data
 
 ---
 
@@ -220,17 +271,17 @@ Training data: [Google Cluster Workload Traces v2](https://github.com/google/clu
 ### Local
 
 - [ ] `python app.py` starts without errors
-- [ ] `http://localhost:5000` loads dashboard
-- [ ] `/health` returns 200
-- [ ] All 5 sidebar pages work
-- [ ] Demo Controls visible and clickable
+- [ ] `http://localhost:5000` loads the dashboard
+- [ ] `GET /health` returns `200 OK`
+- [ ] All 5 sidebar pages render correctly
+- [ ] Demo Controls panel visible (bottom-right)
 - [ ] Burst C triggers ESCALATE within 3 minutes
-- [ ] Phone rings when ESCALATE fires
-- [ ] Email arrives for SCALE decision
+- [ ] Phone rings when ESCALATE fires (requires Twilio credentials)
+- [ ] Email arrives for SCALE decision (requires SMTP credentials)
 
 ### Docker
 
-- [ ] `docker-compose up` builds successfully
-- [ ] `http://localhost:5000` loads dashboard
-- [ ] `/health` returns 200
-- [ ] All env vars passed correctly
+- [ ] `docker-compose up --build` completes successfully
+- [ ] `http://localhost:5000` loads the dashboard
+- [ ] `GET /health` returns `200 OK`
+- [ ] Environment variables injected from `.env`

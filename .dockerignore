@@ -1,0 +1,53 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Secrets
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Data (not needed at runtime)
+data/
+results/
+experiments/
+mlruns/
+
+# Training artifacts (models are loaded from models/)
+saved_model.pkl
+saved_model.keras
+*.log
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# Documentation
+README.md
+*.md
+calibration_diagram.png
+
+# Unused scripts
+ablation_study.py
+calibration.py
+crashguard_ai.py
+demo_trigger.py
+error_analysis.py
+evaluate.py
+live_monitor.py
+lstm_model.py
+preprocessing.py
+rewrite_alert.py
+rewrite_engine.py
+run_experiments.py
+test_pipeline.py
+train.py
+xgboost_model.py
