@@ -5,10 +5,11 @@ Unified alert engine: Twilio + Slack + Email + Cooldown + Layered Fallback.
 Alerts are DERIVED from DecisionEngine output — zero independent logic.
 
 Delivery architecture:
-  ESCALATE → Twilio phone call (fallback: email → Slack → dry-run)
+  ESCALATE → Twilio phone call + email (fallback: Slack → dry-run)
   SCALE    → Email (fallback: Slack → dry-run)
-  MONITOR  → Email (fallback: Slack → dry-run)
-  STABLE   → No action
+  RESTART  → Email (fallback: Slack → dry-run)
+  MONITOR  → Dashboard only (no external notification)
+  STABLE   → Dashboard only
 
 FIX 2 — Realistic alert deduplication with per-server suppression tracking.
 FIX 3 — Gmail SMTP email alerts for CRITICAL + HIGH severity.
@@ -104,9 +105,9 @@ SEVERITY_COLOR = {
     "INFO":     "#00BFFF",
 }
 
-# FIX 3 — Email fires for CRITICAL and HIGH severity (ESCALATE + SCALE) + RESTART/MONITOR
-ALERTABLE_DECISIONS = {"ESCALATE", "SCALE", "SCALE_READY", "RESTART", "MONITOR"}
-EMAIL_DECISIONS     = {"ESCALATE", "SCALE"}
+# Production alert routing — only meaningful incidents generate external notifications
+ALERTABLE_DECISIONS = {"ESCALATE", "SCALE", "RESTART"}
+EMAIL_DECISIONS     = {"ESCALATE", "SCALE", "RESTART"}
 
 # FIX 2 — Suppression sanity cap per session
 MAX_SUPPRESSIONS_PER_SESSION = 50
@@ -219,7 +220,7 @@ def build_slack_blocks(alert: dict) -> dict:
         },
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Autonomous Action*\n⚙ {alert['action']}"}
+            "text": {"type": "mrkdwn", "text": f"*Autonomous Mitigation*\n⚙ {alert['action']}"}
         },
         {"type": "divider"},
         {
@@ -255,7 +256,7 @@ def build_email(alert: dict, smtp_user: str, email_to: str) -> MIMEMultipart:
         f"Server:     {alert['server_name']}\n"
         f"Current CPU: {alert['cpu']:.1f}%\n"
         f"Predicted:  {alert['predicted_cpu']:.1f}%\n"
-        f"Crash Risk: {alert['risk']:.0%}\n"
+        f"Operational Risk: {alert['risk']:.0%}\n"
         f"Decision:   {alert['decision']}\n"
         f"Timestamp:  {alert['timestamp']}\n"
         f"Action:     {alert['action']}\n"
@@ -272,101 +273,187 @@ def build_email(alert: dict, smtp_user: str, email_to: str) -> MIMEMultipart:
 
 
 # ─────────────────────────────────────────────
-# DYNAMIC VOICE INTELLIGENCE BUILDER
+# DYNAMIC VOICE INTELLIGENCE ENGINE
+# Production-grade, anti-repetition phrase system.
+# Messages are contextual, adaptive, and under 20 seconds.
 # ─────────────────────────────────────────────
 
-VOICE_INTROS = [
+# ── PHRASE POOLS (rotated randomly to prevent identical calls) ──
+
+_VOICE_INTROS = [
     "This is CrashGuard AI.",
-    "CrashGuard automated operations.",
-    "CrashGuard infrastructure monitor."
+    "Automated infrastructure alert.",
+    "CrashGuard escalation notification.",
+    "CrashGuard operations alert.",
+    "Infrastructure monitoring notification.",
 ]
 
-VOICE_SEV_95 = [
-    "Severe infrastructure instability detected on",
-    "Critical resource exhaustion imminent on",
-    "Major operational disruption detected on"
+_VOICE_SEV_SEVERE = [
+    "Severe infrastructure instability detected on {server}.",
+    "Critical resource exhaustion detected on {server}.",
+    "Major operational disruption on {server}.",
+    "Severe capacity failure detected on {server}.",
 ]
 
-VOICE_SEV_90 = [
-    "Critical incident detected on",
-    "High severity alert for",
-    "Urgent load anomaly detected on"
+_VOICE_SEV_CRITICAL = [
+    "Critical escalation detected on {server}.",
+    "Critical load conditions detected on {server}.",
+    "Urgent escalation triggered for {server}.",
+    "High severity incident on {server}.",
 ]
 
-VOICE_SEV_80 = [
-    "Elevated system load detected on",
-    "Unusual resource consumption observed on",
-    "Significant load increase detected on"
+_VOICE_SEV_HIGH = [
+    "High infrastructure load detected on {server}.",
+    "Elevated system load detected on {server}.",
+    "Significant load increase on {server}.",
+    "High load conditions detected on {server}.",
 ]
 
-VOICE_RECOVERY = [
-    "load is beginning to stabilize after automated intervention",
-    "is showing signs of recovery",
-    "pressure is currently decreasing"
+_VOICE_SEV_STABILIZING = [
+    "Load is beginning to stabilize on {server}.",
+    "{server} is showing signs of recovery.",
+    "System pressure is decreasing on {server}.",
+    "Conditions are stabilizing on {server}.",
 ]
 
-VOICE_CONTEXT_RISING = [
-    "Load continues to rise rapidly",
-    "System pressure is escalating quickly"
+# ── CPU CONTEXT PHRASES ──
+
+_VOICE_CPU_CRITICAL = [
+    "CPU utilization remains critically elevated at {cpu} percent.",
+    "Current CPU usage is at {cpu} percent.",
+    "CPU remains at {cpu} percent.",
 ]
 
-VOICE_ACT_ESCALATE = [
-    "Immediate engineer investigation is recommended.",
-    "Manual intervention may now be required.",
+_VOICE_CPU_HIGH = [
+    "Current CPU utilization is {cpu} percent.",
+    "Current CPU usage remains elevated at {cpu} percent.",
+    "CPU is currently at {cpu} percent.",
+]
+
+# ── TREND-AWARE PHRASES ──
+
+_VOICE_TREND_RISING = [
+    "Predicted workload is continuing to rise rapidly.",
+    "Predicted workload continues rising beyond safe thresholds.",
+    "System pressure is expected to escalate further.",
+]
+
+_VOICE_TREND_ELEVATED = [
+    "Workload is expected to remain critically elevated.",
+    "Predicted workload is expected to exceed safe operating thresholds within the next few minutes.",
+    "Load is projected to remain at critical levels.",
+]
+
+_VOICE_TREND_STABILIZING = [
+    "Workload is beginning to stabilize.",
+    "Predicted load is trending downward.",
+    "System load is expected to decrease.",
+]
+
+# ── MITIGATION STATUS PHRASES ──
+
+_VOICE_MITIGATION_SCALED = [
+    "Automatic scaling has already been triggered.",
+    "Automated scaling procedures were initiated.",
+    "Autonomous scaling has been activated.",
+]
+
+_VOICE_MITIGATION_RESTARTED = [
+    "Automated recovery procedures completed.",
+    "Automated restart procedures have been executed.",
+    "Recovery intervention has completed.",
+]
+
+_VOICE_MITIGATION_MONITORING = [
+    "Monitoring escalation conditions.",
+    "System remains under active monitoring.",
+    "Continuous monitoring is in effect.",
+]
+
+# ── ACTION RECOMMENDATION PHRASES ──
+
+_VOICE_ACT_ESCALATE = [
+    "Immediate operator review is recommended.",
     "On-call escalation has been initiated.",
-    "Human review is advised."
+    "Manual investigation may now be required.",
+    "Immediate engineer review is recommended.",
 ]
 
-VOICE_ACT_SCALE = [
-    "Automatic scaling has already been triggered",
-    "Automatic scaling procedures were successfully initiated",
-    "Autonomous scaling procedures were initiated"
+_VOICE_ACT_WATCH = [
+    "Monitoring continues.",
+    "Continued observation is advised.",
+    "No immediate action required at this time.",
 ]
 
-VOICE_ACT_MONITOR = [
-    "System stability is currently being monitored.",
-    "Monitoring remains active.",
-    "System remains under observation."
-]
 
 def build_voice_message(decision_data: dict) -> str:
-    """Generate dynamic, operationally realistic voice message."""
-    intro = random.choice(VOICE_INTROS)
+    """
+    Generate a dynamic, operationally realistic voice message.
+
+    Adapts based on: server name, current CPU, predicted CPU, operational risk,
+    trend direction, mitigation status, escalation severity, and recovery.
+
+    Returns a concise spoken message suitable for Twilio TTS (under 20 seconds).
+    """
     server_name = decision_data.get("server_name", "Unknown Server")
-    cpu = round(float(decision_data.get("cpu", 0)))
+    cpu = round(float(decision_data.get("cpu", decision_data.get("current_cpu", 0))))
+    predicted_cpu = round(float(decision_data.get("predicted_cpu", cpu)))
     decision = decision_data.get("decision", "ESCALATE")
     trend = decision_data.get("trend", "stable")
-    
-    if trend in ("rapidly_falling", "falling") or decision == "MONITOR":
-        sev = f"{server_name} {random.choice(VOICE_RECOVERY)}."
-        ctx = "CPU utilization has dropped below critical thresholds."
-        act = random.choice(VOICE_ACT_MONITOR)
-        return f"{intro} {sev} {ctx} {act}"
+    action_text = decision_data.get("action", "").lower()
 
-    if cpu >= 95:
-        sev = f"{random.choice(VOICE_SEV_95)} {server_name}."
+    parts = []
+
+    # ── 1. INTRO (rotated) ──
+    parts.append(random.choice(_VOICE_INTROS))
+
+    # ── 2. SEVERITY PHRASE (CPU-threshold driven) ──
+    is_stabilizing = trend in ("rapidly_falling", "falling") or predicted_cpu < cpu - 3
+
+    if is_stabilizing and decision not in ("ESCALATE",):
+        parts.append(random.choice(_VOICE_SEV_STABILIZING).format(server=server_name))
+    elif cpu > 95:
+        parts.append(random.choice(_VOICE_SEV_SEVERE).format(server=server_name))
     elif cpu >= 90:
-        sev = f"{random.choice(VOICE_SEV_90)} {server_name}."
+        parts.append(random.choice(_VOICE_SEV_CRITICAL).format(server=server_name))
+    elif cpu >= 80:
+        parts.append(random.choice(_VOICE_SEV_HIGH).format(server=server_name))
     else:
-        sev = f"{random.choice(VOICE_SEV_80)} {server_name}."
-        
-    if trend in ("rapidly_rising", "rising"):
-        ctx = f"{random.choice(VOICE_CONTEXT_RISING)}. CPU usage is at {cpu} percent."
-    else:
-        ctx = f"CPU usage is currently at {cpu} percent."
-        
+        parts.append(random.choice(_VOICE_SEV_HIGH).format(server=server_name))
+
+    # ── 3. CPU CONTEXT (no decimals, natural wording) ──
+    if not is_stabilizing or decision == "ESCALATE":
+        if cpu >= 90:
+            parts.append(random.choice(_VOICE_CPU_CRITICAL).format(cpu=cpu))
+        else:
+            parts.append(random.choice(_VOICE_CPU_HIGH).format(cpu=cpu))
+
+    # ── 4. TREND PHRASE (predicted vs current) ──
+    if predicted_cpu > cpu + 5:
+        parts.append(random.choice(_VOICE_TREND_RISING))
+    elif abs(predicted_cpu - cpu) <= 5 and cpu >= 80:
+        parts.append(random.choice(_VOICE_TREND_ELEVATED))
+    elif predicted_cpu < cpu:
+        parts.append(random.choice(_VOICE_TREND_STABILIZING))
+
+    # ── 5. MITIGATION STATUS (inferred from decision + action text) ──
+    if decision in ("ESCALATE", "SCALE") or "scal" in action_text:
+        parts.append(random.choice(_VOICE_MITIGATION_SCALED))
+    elif decision == "RESTART" or "restart" in action_text or "recover" in action_text:
+        parts.append(random.choice(_VOICE_MITIGATION_RESTARTED))
+    elif decision == "MONITOR":
+        parts.append(random.choice(_VOICE_MITIGATION_MONITORING))
+
+    # ── 6. ACTION RECOMMENDATION ──
     if decision == "ESCALATE":
-        act1 = random.choice(VOICE_ACT_SCALE)
-        act2 = random.choice(VOICE_ACT_ESCALATE)
-        act = f"{act1}, but instability persists. {act2}"
+        parts.append(random.choice(_VOICE_ACT_ESCALATE))
+    elif is_stabilizing:
+        parts.append(random.choice(_VOICE_ACT_WATCH))
     elif decision == "SCALE":
-        act1 = random.choice(VOICE_ACT_SCALE)
-        act2 = random.choice(VOICE_ACT_MONITOR)
-        act = f"{act1}. {act2}"
-    else:
-        act = random.choice(VOICE_ACT_MONITOR)
-        
-    return f"{intro} {sev} {ctx} {act}"
+        parts.append(random.choice(_VOICE_ACT_WATCH))
+    # MONITOR / STABLE — no extra action line (mitigation phrase covers it)
+
+    return " ".join(parts)
 
 
 # ─────────────────────────────────────────────
@@ -445,8 +532,11 @@ class AlertSystem:
                 self._timeline.pop(0)
 
     def get_timeline(self) -> list[dict]:
+        """Return timeline filtered to operational events only. Internal routing excluded."""
+        _VISIBLE_TYPES = {"ESCALATE", "SCALE", "RESTART", "MONITOR", "RECOVERED",
+                          "CALL_TRIGGERED", "EMAIL_SENT", "EMAIL_FAILED", "TWILIO_FAILED"}
         with self._lock:
-            return list(self._timeline)
+            return [e for e in self._timeline if e.get("type", "") in _VISIBLE_TYPES]
 
     def process_decisions(self, decisions: dict[str, dict]) -> list[dict]:
         """Process all decisions from engine. Returns list of fired alerts."""
@@ -488,12 +578,10 @@ class AlertSystem:
         if not self._cooldown.can_send_with_cooldown(server_id, cooldown):
             if not is_duplicate:
                 print(f"[COOLDOWN] Bypassed for {server_name} — decision changed from {last_dec} to {dec}")
-                self._record_timeline("COOLDOWN_BYPASSED", server_id, f"Changed to {dec}")
             else:
                 remaining = self._cooldown.seconds_remaining(server_id, cooldown)
                 print(f"[COOLDOWN_SUPPRESSED] server={server_id} decision={dec} remaining={remaining}s")
                 logger.debug(f"Alert suppressed for {server_id} — cooldown {remaining}s remaining")
-                self._record_timeline("COOLDOWN_SUPPRESSED", server_id, f"{remaining}s remaining")
                 with self._lock:
                     self._suppressed_by_cooldown[server_id] = self._suppressed_by_cooldown.get(server_id, 0) + 1
                     self._total_suppressed_session += 1
@@ -519,14 +607,14 @@ class AlertSystem:
         email_sent  = False
         dry_run     = False
 
-        # Layer 0: Twilio phone call for ESCALATE (FIX 4)
+        # Layer 0: Route decisions to appropriate channels
         current_cpu = alert.get("cpu", 0)
-        if dec in ("MONITOR", "SCALE_READY", "STABLE", "RESTART") and dec not in EMAIL_DECISIONS:
-            print(f"[ROUTER] decision={dec} channel=DASHBOARD_ONLY")
-        elif dec == "SCALE":
-            print(f"[ROUTER] decision={dec} channel=EMAIL")
-        elif dec == "ESCALATE":
-            print(f"[ROUTER] decision={dec} channel=TWILIO+EMAIL")
+        if dec == "ESCALATE":
+            print(f"[ROUTER] decision={dec} channel=TWILIO+EMAIL server={server_id}")
+        elif dec in ("SCALE", "RESTART"):
+            print(f"[ROUTER] decision={dec} channel=EMAIL server={server_id}")
+        else:
+            print(f"[ROUTER] decision={dec} channel=DASHBOARD_ONLY server={server_id}")
 
         if dec == "ESCALATE" and TWILIO_AVAILABLE and self._has_twilio():
             try:

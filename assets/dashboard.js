@@ -252,7 +252,9 @@ function processData(data) {
   }).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
   S.alertCount = S.alertLog.length;
-  S.timeline = (data.timeline || []).slice().reverse(); // show latest first
+  // Filter timeline: only operational events (backend already filters, but safety net)
+  const _VIS = new Set(['ESCALATE','SCALE','RESTART','MONITOR','RECOVERED','CALL_TRIGGERED','EMAIL_SENT','EMAIL_FAILED','TWILIO_FAILED']);
+  S.timeline = (data.timeline || []).filter(e => _VIS.has(e.type || '')).slice().reverse();
   
   if (critCount > 0 && S.alertLog.length === 0) {
     throw new Error("Inconsistent alert state — registry failure");
@@ -585,7 +587,7 @@ function renderAlertsPage() {
               <ul style="margin:4px 0 0 0;padding-left:14px;font-size:11px;color:var(--text2);line-height:1.7;">
                 <li>CPU: ${cpu.toFixed ? cpu.toFixed(1) : cpu}% (${trend})</li>
                 <li>Predicted: ${pred.toFixed ? pred.toFixed(1) : pred}%</li>
-                <li>Crash risk: ${cr}%</li>
+                <li>Operational risk: ${cr}%</li>
                 <li>Confidence: ${conf}%</li>
                 <li>Spike count: ${spikes}</li>
               </ul>
@@ -792,7 +794,7 @@ function renderPredictionsPage() {
   const topLine = document.getElementById('top-risk-line');
   if (topLine && topRisk && topRisk.model_used !== 'warming_up') {
     const cr = ((topRisk.crash_risk_5min || topRisk.spike_probability || 0) * 100).toFixed(0);
-    topLine.textContent = topRisk.server_name + ' — ' + cr + '% crash risk';
+    topLine.textContent = topRisk.server_name + ' — ' + cr + '% operational risk';
     topLine.style.color = cr > 60 ? '#ef4444' : cr > 35 ? '#f97316' : '#eab308';
   }
 
@@ -826,7 +828,7 @@ function renderPredictionsPage() {
     if ((s.spike_count || 0) >= 10) thresholds.push('10+ spikes → ESCALATE threshold');
     else if ((s.spike_count || 0) >= 3) thresholds.push('3+ spikes → RESTART threshold');
     if ((s.predicted_cpu || 0) > 80.8) thresholds.push('Predicted > 80.8% → SCALE threshold');
-    if (cr > 60) thresholds.push('Crash risk > 60% (high)');
+    if (cr > 60) thresholds.push('Operational risk > 60% (high)');
     if (thresholds.length === 0) thresholds.push('No thresholds crossed');
 
     // Recent decision history for this server
@@ -860,7 +862,7 @@ function renderPredictionsPage() {
                 <li>Trend: ${ticon} ${s.trend || 'stable'} (Δ ${diff > 0 ? '+' : ''}${diff.toFixed(1)}%)</li>
                 <li>Predicted CI: ${ciL}% – ${ciU}%</li>
                 <li>Prediction Confidence: ${conf}%</li>
-                <li>Crash risk: ${cr}%</li>
+                <li>Operational risk: ${cr}%</li>
                 <li>Spikes in window: ${s.spike_count || 0}</li>
               </ul>
               <div style="font-size:10px;color:var(--text3);margin-top:6px;line-height:1.5;">${reason}</div>

@@ -393,6 +393,17 @@ def build_explanation(
             )
         action = "Paging on-call engineer — SLA breach risk in next 5 minutes"
 
+        # FIX 5 — Handle contradiction: predicted < current but decision still ESCALATE
+        if corrected_pred < current_cpu:
+            reason = (
+                f"Sustained instability despite short-term forecast decline. "
+                f"Server under {load_state} at {current_cpu:.1f}% ({trend_str}) with "
+                f"{spike_count} spikes in 10 min — abnormal volatility and spike frequency "
+                f"({round(spike_rate, 1)}/min) indicate workload cannot self-stabilize. "
+                f"Escalation maintained due to persistent overload behavior "
+                f"and confidence override."
+            )
+
     elif decision == "SCALE":
         margin = corrected_pred - SCALE_CPU_THRESHOLD
         if current_cpu >= 85:
@@ -422,6 +433,17 @@ def build_explanation(
             )
         action = "Triggering horizontal autoscale — provisioning additional compute instances"
 
+        # FIX 5 — Handle contradiction: predicted < current but decision still SCALE
+        if corrected_pred < current_cpu:
+            reason = (
+                f"Sustained instability detected despite short-term forecast decline. "
+                f"Server under {load_state} at {current_cpu:.1f}% ({trend_str}) — "
+                f"spike persistence ({spike_count} events in 10 min) and abnormal volatility "
+                f"override transient prediction drop. "
+                f"Scaling maintained due to persistent overload behavior "
+                f"at {confidence:.0%} model confidence."
+            )
+
     elif decision == "SCALE_READY":
         reason = (
             f"Preemptive staging under {load_state} ({trend_str}). "
@@ -437,7 +459,7 @@ def build_explanation(
         elif trend in ("falling", "rapidly_falling"):
             why_not_action = f"Trend is {trend_str} — holding action to avoid unnecessary intervention. "
         else:
-            why_not_action = f"Risk score {spike_prob:.0%} below scale trigger — awaiting confirmation. "
+            why_not_action = f"Operational risk {spike_prob:.0%} below scale trigger — monitoring sustained threshold breach. "
         reason = (
             f"Server under {load_state} at {current_cpu:.1f}% ({trend_str}). "
             f"{why_not_action}"
@@ -779,7 +801,7 @@ class DecisionEngine:
             # RECOVERY-AWARE: system is self-healing, do NOT scale
             decision = "MONITOR"
         elif crash_risk > 0.65 and current_cpu > 65:
-            # RISK-FIRST: high crash risk + CPU above moderate threshold
+            # RISK-FIRST: high operational risk + CPU above moderate threshold
             # CPU floor prevents unrealistic SCALE at normal load levels
             decision = "SCALE"
         elif crash_risk > 0.40 and current_cpu > 55:
@@ -882,7 +904,7 @@ class DecisionEngine:
         severity = DECISIONS[decision]["severity"]
         color    = DECISIONS[decision]["color"]
 
-        # ── Crash risk — already computed above for risk-first logic ──
+        # ── Operational risk — already computed above for risk-first logic ──
         crash_risk_5min = round(crash_risk, 4)
 
         # ── Alert Registry ─────────────────────────────
