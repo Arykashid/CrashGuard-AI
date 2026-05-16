@@ -1,4 +1,4 @@
-﻿# CrashGuard AI
+# CrashGuard AI
 
 ### Autonomous CPU Workload Forecasting and Infrastructure Decision System
 
@@ -243,6 +243,18 @@ CrashGuard runs as a single Docker container. Deploy directly from the repositor
 
 ---
 
+## Acknowledgements
+
+- TensorFlow — LSTM forecasting pipeline
+- XGBoost — Ensemble risk classification
+- Flask — Backend API services
+- Streamlit — Real-time operational dashboard
+- Docker — Containerized deployment
+- Twilio — Escalation call routing
+- Gmail SMTP — Automated alert notifications
+
+---
+
 ## Citation
 
 Training data: [Google Cluster Workload Traces v2](https://github.com/google/cluster-data) (Reiss et al., 2011)
@@ -268,3 +280,9 @@ Training data: [Google Cluster Workload Traces v2](https://github.com/google/clu
 - [ ] `http://localhost:5000` loads the dashboard
 - [ ] `GET /health` returns `200 OK`
 - [ ] Environment variables injected from `.env`
+
+---
+
+<p align="center">
+Real-time operational inference system for calibrated risk scoring, infrastructure forecasting, and autonomous mitigation routing.
+</p>
