@@ -197,8 +197,60 @@ function processData(data) {
   // Track decision version for staleness detection
   if (data.decision_version != null) S.decisionVersion = data.decision_version;
 
+  S.current_operational_state = S.current_operational_state || {};
+  const nowTs = Date.now();
+
+  servers.forEach((s, idx) => {
+    let state = S.current_operational_state[s.server_id] || { 
+      last_escalation_time: 0, 
+      escalation_active: false,
+      cooldown_active: false
+    };
+
+    const isBackendEscalated = (s.decision === 'ESCALATE' || s.decision === 'SCALE');
+    const isCpuDropping = s.current_cpu < 80;
+
+    if (isBackendEscalated && !isCpuDropping) {
+      state.escalation_active = true;
+      state.cooldown_active = false;
+      state.last_escalation_time = nowTs;
+    }
+    
+    if (state.escalation_active && isCpuDropping) {
+      state.escalation_active = false;
+      state.cooldown_active = true;
+    }
+
+    if (state.cooldown_active && (nowTs - state.last_escalation_time > 60000)) {
+      state.cooldown_active = false;
+    }
+
+    let displayDecision = s.decision;
+    let displayAction = s.action;
+
+    if (state.cooldown_active && isBackendEscalated) {
+      displayDecision = s.current_cpu > 65 ? 'SCALE_READY' : 'MONITOR';
+      displayAction = "Escalation cooldown active — monitoring for sustained instability";
+    }
+
+    const authState = {
+      ...s,
+      decision: displayDecision,
+      raw_decision: s.decision,
+      incident_active: displayDecision !== 'STABLE',
+      escalation_active: state.escalation_active,
+      cooldown_active: state.cooldown_active,
+      last_escalation_time: state.last_escalation_time,
+      action: displayAction,
+      severity: displayDecision === 'ESCALATE' ? 'CRITICAL' : displayDecision === 'SCALE' ? 'HIGH' : displayDecision === 'STABLE' ? 'INFO' : 'WARNING'
+    };
+
+    S.current_operational_state[s.server_id] = state;
+    servers[idx] = authState;
+  });
+
   let critCount = 0, worstServer = null, worstPriority = -1;
-  const PRIORITY = { ESCALATE: 5, SCALE: 4, RESTART: 3, MONITOR: 2, STABLE: 1 };
+  const PRIORITY = { ESCALATE: 5, SCALE: 4, RESTART: 3, MONITOR: 2, SCALE_READY: 2, STABLE: 1 };
 
   servers.forEach(s => {
     const prev = S.servers[s.server_id];
@@ -359,7 +411,7 @@ function renderServers(servers) {
   panel.innerHTML = '';
   servers.forEach(s => {
     const dc = DC[s.decision] || DC.STABLE;
-    const barColor = s.current_cpu > 80 ? '#ef4444' : s.current_cpu > 60 ? '#f97316' : '#3b82f6';
+    const barColor = dc.color;
     const selected = S.selected === s.server_id;
     const row = document.createElement('div');
     row.className = 'server-row' + (selected ? ' selected' : '');
@@ -406,7 +458,8 @@ function renderFleet(servers) {
   el.innerHTML = '';
   servers.forEach(s => {
     const pct = Math.min(s.current_cpu, 100);
-    const color = s.current_cpu > 80 ? '#ef4444' : s.current_cpu > 60 ? '#f97316' : '#22c55e';
+    const dc = DC[s.decision] || DC.STABLE;
+    const color = dc.color;
     el.innerHTML += `
       <div class="fleet-row">
         <span class="fleet-name">${s.server_name.split('—')[0].trim()}</span>
@@ -455,7 +508,7 @@ function renderSystemsPage() {
   if (servers.length === 0) { el.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:20px">Warming up...</td></tr>'; return; }
   el.innerHTML = servers.map(s => {
     const dc = DC[s.decision] || DC.STABLE;
-    const barColor = s.current_cpu > 80 ? '#ef4444' : s.current_cpu > 60 ? '#f97316' : '#22c55e';
+    const barColor = dc.color;
     const pct = Math.min(s.current_cpu, 100);
     const TDISPLAY = { rapidly_rising: '📈 Rising fast', rising: '↗ Rising', stable: '→ Stable', falling: '↘ Falling', rapidly_falling: '📉 Falling fast', volatile: '⚡ Volatile', elevated: '↑ Elevated' };
     let trendStr = s.trend ? (TDISPLAY[s.trend] || s.trend) : '—';

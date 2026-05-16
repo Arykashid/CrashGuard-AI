@@ -21,6 +21,8 @@ CrashGuard predicts CPU overload events before they happen and responds autonomo
 ### Dashboard
 ![Dashboard — live decision banner, CPU chart with prediction overlay, fleet status, incident timeline](assets/screenshots/dashboard.png)
 
+> **Demo Note:** Run with `DEMO_MODE=1`, wait approximately 60–90 seconds for telemetry stabilization, then trigger Burst C to activate the graduated escalation sequence demonstrated in the walkthrough.
+
 ### Systems
 ![Systems — per-server CPU utilization, trend direction, live decision badges](assets/screenshots/systems.png)
 
@@ -37,32 +39,39 @@ CrashGuard predicts CPU overload events before they happen and responds autonomo
 
 ## Architecture
 
-```
-Raw CPU Telemetry (2s tick rate)
-         │
-         ▼
-┌─────────────────────┐
-│   Feature Engine     │  15 signals: lags, rolling stats,
-│                      │  cyclical time encoding, delta, spike_flag
-└──────────┬──────────┘
+```text
+Raw Telemetry (CPU / Memory / Network)
+                │
+                ▼
+┌──────────────────────────┐
+│     Feature Engine       │
+│ Rolling stats, spikes,   │
+│ lags, scaling            │
+└──────────┬───────────────┘
            │
            ▼
-┌──────────────────────────────┐
-│   LSTM + XGBoost Ensemble    │  MC Dropout uncertainty bounds
-│   60/40 dynamic weighting    │  Temperature scaling T = 9.5518
-└──────────┬───────────────────┘
+┌──────────────────────────┐
+│   LSTM + XGBoost         │
+│ Ensemble Forecasting     │
+└──────────┬───────────────┘
            │
            ▼
-┌──────────────────────────────┐
-│   Decision Engine v5         │  Graduated escalation
-│   Risk score + hysteresis    │  Confidence gating
-│   Adaptive weights           │  State machine enforcement
-└──────┬───────────────────────┘
+┌──────────────────────────┐
+│ Confidence Calibration   │
+│ Temperature Scaling      │
+└──────────┬───────────────┘
+           │
+           ▼
+┌──────────────────────────┐
+│ Decision Engine v5       │
+│ Risk + Hysteresis        │
+│ State Enforcement        │
+└──────┬───────────────────┘
        │
-  ┌────┴────────────────┐
-  ▼                     ▼
-Autoscale/Restart    📞 Twilio Call
-                     📧 Email Alert
+  ┌────┴─────────────┐
+  ▼                  ▼
+Auto Mitigation   Alert Routing
+(scale/restart)   (Email/Twilio)
 ```
 
 ---
@@ -76,7 +85,7 @@ Autoscale/Restart    📞 Twilio Call
 | LSTM RMSE | 0.2328 |
 | Diebold-Mariano p-value | 0.0086 (ensemble significantly outperforms individual models) |
 | 80% CI Coverage | 80.0% (calibrated — matches claimed interval) |
-| Calibration Temperature | T = 9.5518 (Platt scaling) |
+| Calibration Temperature | T = 9.5518 (temperature scaling) |
 | Training Data | ~60,000 records from Google Cluster Workload Traces |
 | Engineered Features | 15 signals per timestep |
 | MC Dropout Samples | 15 forward passes per prediction |
@@ -247,6 +256,7 @@ CrashGuard runs as a single Docker container. Deploy directly from the repositor
 - Model trained on [Google Cluster Workload Traces](https://github.com/google/cluster-data) — performance on workloads with different characteristics (e.g., GPU-bound, IO-heavy) has not been validated.
 - The 5-server simulator generates synthetic CPU patterns for demonstration. Production deployment requires integration with real telemetry sources (e.g., `psutil`, Prometheus, or cloud provider APIs).
 - Trial Twilio accounts are limited to verified phone numbers only.
+- Current evaluation was performed primarily on controlled telemetry simulations and limited-node environments. Real-world production deployment would require larger-scale distributed validation, adaptive retraining, and drift-aware monitoring under dynamic infrastructure conditions.
 
 ---
 

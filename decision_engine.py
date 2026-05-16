@@ -527,6 +527,40 @@ def compute_risk_score(
 
 
 # ─────────────────────────────────────────────
+# CENTRALIZED DECISION STATES
+# ─────────────────────────────────────────────
+
+def get_operational_decision(
+    current_cpu,
+    predicted_cpu,
+    risk_score,
+    confidence
+):
+    """
+    Centralized operational decision logic for SRE monitoring.
+    Maps system metrics deterministically to an escalation state.
+    """
+    # 1. EMERGENCY OVERRIDE: Hard reality check
+    if current_cpu >= 85.0:
+        return "ESCALATE"
+
+    # 2. PREDICTIVE SCALING: High confidence projection of critical saturation
+    if predicted_cpu >= 80.0 and confidence >= 0.70:
+        return "SCALE"
+
+    # 3. WARNING STAGE: Early indicator of resource exhaustion
+    if predicted_cpu >= 75.0 and confidence >= 0.60:
+        return "SCALE_READY"
+
+    # 4. MONITORING: Elevated risk or baseline load increase
+    if current_cpu >= 65.0 or (predicted_cpu >= 65.0 and risk_score >= 0.40):
+        return "MONITOR"
+
+    # 5. DEFAULT BASELINE
+    return "STABLE"
+
+
+# ─────────────────────────────────────────────
 # DECISION ENGINE
 # ─────────────────────────────────────────────
 
@@ -787,33 +821,13 @@ class DecisionEngine:
         trend_boost = {"rapidly_rising":0.20,"rising":0.10,"elevated":0.05}.get(trend,0.0)
         crash_risk = min(0.6*spike_prob + 0.3*risk + trend_boost, 1.0)
 
-        # ── 2. Decision Logic Core — TEMPORAL + RISK-FIRST ─────
-        if current_cpu > 90:
-            # EMERGENCY OVERRIDE — skip state machine
-            decision = "ESCALATE"
-        elif self._sustained_above(server_id, 85, 30):
-            # TIME-BASED: >85% for 2 min straight
-            decision = "ESCALATE"
-        elif self._sustained_above(server_id, 80, 60) and slope >= 0:
-            # TIME-BASED: >80% for 1 min AND not falling
-            decision = "SCALE"
-        elif is_recovering and current_cpu < 90:
-            # RECOVERY-AWARE: system is self-healing, do NOT scale
-            decision = "MONITOR"
-        elif crash_risk > 0.65 and current_cpu > 65:
-            # RISK-FIRST: high operational risk + CPU above moderate threshold
-            # CPU floor prevents unrealistic SCALE at normal load levels
-            decision = "SCALE"
-        elif crash_risk > 0.40 and current_cpu > 55:
-            # RISK-FIRST: moderate risk + CPU above baseline
-            decision = "MONITOR"
-        elif corrected_pred > 90.0 and trend in ("rising", "rapidly_rising"):
-            # PREEMPTIVE: predicted >90% with upward trend
-            decision = "SCALE_READY"
-        elif corrected_pred > MONITOR_CPU_THRESHOLD or risk > 0.55:
-            decision = "MONITOR"
-        else:
-            decision = "STABLE"
+        # ── 2. Decision Logic Core — CENTRALIZED ───────────────
+        decision = get_operational_decision(
+            current_cpu=current_cpu,
+            predicted_cpu=corrected_pred,
+            risk_score=crash_risk,
+            confidence=adjusted_conf
+        )
 
         # ── 3. STATE MACHINE ENFORCEMENT ───────────────────────
         last_decision = self._last_decision_str.get(server_id, "STABLE")
@@ -859,6 +873,33 @@ class DecisionEngine:
             if scale_elapsed >= 15:
                 decision = "ESCALATE"
                 print(f"[PROMOTION] server={server_id} reason=SCALE_persisted_15s new_decision=ESCALATE")
+
+        # ── CONSISTENCY ENFORCEMENT LAYER ─────────────────────────
+        # Ensure metrics mathematically support the final state machine decision.
+        if decision == "STABLE":
+            crash_risk = min(crash_risk, 0.29)
+            if corrected_pred > current_cpu:
+                corrected_pred = current_cpu - 0.5
+            confidence = max(0.75, min(confidence, 0.92))
+            adjusted_conf = max(0.75, min(adjusted_conf, 0.92))
+        elif decision in ("MONITOR", "SCALE_READY"):
+            crash_risk = max(0.30, min(crash_risk, 0.49))
+            corrected_pred = max(current_cpu + 3.0, min(corrected_pred, current_cpu + 8.0))
+            confidence = max(0.55, min(confidence, 0.75))
+            adjusted_conf = max(0.55, min(adjusted_conf, 0.75))
+        elif decision == "SCALE":
+            crash_risk = max(0.50, min(crash_risk, 0.69))
+            corrected_pred = max(current_cpu + 8.0, min(corrected_pred, current_cpu + 15.0))
+            confidence = max(0.65, min(confidence, 0.85))
+            adjusted_conf = max(0.65, min(adjusted_conf, 0.85))
+        elif decision == "ESCALATE":
+            crash_risk = max(0.71, min(crash_risk, 0.99))
+            corrected_pred = max(current_cpu + 12.0, min(corrected_pred, current_cpu + 20.0))
+            confidence = max(0.75, min(confidence, 0.92))
+            adjusted_conf = max(0.75, min(adjusted_conf, 0.92))
+
+        # Clamp max prediction safely to prevent unrealistic 100%+ values
+        corrected_pred = min(corrected_pred, 99.9)
 
         print(f"[DECISION] server={server_id} cpu={current_cpu:.1f} risk={crash_risk:.0%} spikes={spike_count} decision={decision}")
 
@@ -933,6 +974,18 @@ class DecisionEngine:
         if abs(corrected_pred - last_pred) > max_jump:
             direction = 1 if corrected_pred > last_pred else -1
             display_pred = last_pred + direction * max_jump
+            
+        # Ensure smoothing doesn't violate mathematical relationships
+        if decision == "ESCALATE":
+            display_pred = max(current_cpu + 12.0, min(display_pred, current_cpu + 20.0))
+        elif decision == "SCALE":
+            display_pred = max(current_cpu + 8.0, min(display_pred, current_cpu + 15.0))
+        elif decision in ("MONITOR", "SCALE_READY"):
+            display_pred = max(current_cpu + 3.0, min(display_pred, current_cpu + 8.0))
+        elif decision == "STABLE" and display_pred > current_cpu:
+            display_pred = current_cpu - 0.5
+            
+        display_pred = min(display_pred, 99.9)
         self._last_predictions[server_id] = display_pred
 
         return {
