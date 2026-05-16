@@ -1,4 +1,4 @@
-# CrashGuard AI
+﻿# CrashGuard AI
 
 ### Autonomous CPU Workload Forecasting and Infrastructure Decision System
 
@@ -37,44 +37,17 @@ CrashGuard predicts CPU overload events before they happen and responds autonomo
 
 ---
 
-## Architecture
+## System Architecture
 
-```text
-Raw Telemetry (CPU / Memory / Network)
-                │
-                ▼
-┌──────────────────────────┐
-│     Feature Engine       │
-│ Rolling stats, spikes,   │
-│ lags, scaling            │
-└──────────┬───────────────┘
-           │
-           ▼
-┌──────────────────────────┐
-│   LSTM + XGBoost         │
-│ Ensemble Forecasting     │
-└──────────┬───────────────┘
-           │
-           ▼
-┌──────────────────────────┐
-│ Confidence Calibration   │
-│ Temperature Scaling      │
-└──────────┬───────────────┘
-           │
-           ▼
-┌──────────────────────────┐
-│ Decision Engine v5       │
-│ Risk + Hysteresis        │
-│ State Enforcement        │
-└──────┬───────────────────┘
-       │
-  ┌────┴─────────────┐
-  ▼                  ▼
-Auto Mitigation   Alert Routing
-(scale/restart)   (Email/Twilio)
-```
+<p align="center">
+  <img src="assets/architecture.svg" alt="CrashGuard AI Architecture" width="100%">
+</p>
 
----
+<p align="center">
+  <em>
+    Real-time operational inference pipeline with calibrated risk scoring and autonomous mitigation routing.
+  </em>
+</p>
 
 ## Model Performance
 
